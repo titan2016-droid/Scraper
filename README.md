@@ -1,11 +1,11 @@
-# YouTube Transcript Scraper (Web App)
+# YouTube Transcript Scraper (Web App) — Ranked + View Filter
 
-A simple **Streamlit** app that scrapes a YouTube channel's videos (Shorts or Longform) and lets you download a CSV containing:
-- Title
-- URL
-- Video ID
-- View Count (best effort)
-- Transcript (if available)
+This **Streamlit** app:
+- Scans a YouTube channel (Shorts, Longform, or Both)
+- Filters to videos with **>= minimum views** (default 300,000)
+- Pulls **transcripts** for qualifying videos
+- Ranks results by **view_count**
+- Lets you download a **ranked CSV**
 
 ## Run locally
 ```bash
@@ -17,11 +17,10 @@ streamlit run app.py
 
 ## Deploy online (Streamlit Community Cloud)
 1. Push this folder to a GitHub repo.
-2. In Streamlit Community Cloud, create a new app:
-   - Main file: `app.py`
+2. In Streamlit Community Cloud, create a new app (main file: `app.py`).
 3. Deploy.
 
-## Notes
-- Some videos have transcripts disabled.
-- YouTube may rate-limit aggressive scraping. Keep `Max videos` reasonable.
-- Use the channel root URL (e.g., `https://www.youtube.com/@name`) even when scraping Shorts.
+## Notes / Limits
+- View counts require per-video metadata calls. Scanning an entire large channel can take time.
+- Start with a smaller "Max videos to scan" (e.g., 300–800), then increase.
+- Some videos have transcripts disabled or unavailable.

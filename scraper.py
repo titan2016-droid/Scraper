@@ -1,6 +1,6 @@
 import re
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -10,6 +10,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
     CouldNotRetrieveTranscript,
 )
+
 
 def extract_video_id(url: str) -> Optional[str]:
     url = url.strip()
@@ -26,6 +27,7 @@ def extract_video_id(url: str) -> Optional[str]:
     if m:
         return m.group(1)
     return None
+
 
 def get_transcript(video_id: str, language: Optional[str], allow_auto: bool) -> str:
     try:
@@ -57,26 +59,51 @@ def get_transcript(video_id: str, language: Optional[str], allow_auto: bool) -> 
     except Exception:
         return ""
 
+
+def _is_shorts_candidate(url: str, duration: Optional[Union[int, float]]) -> bool:
+    if url and "youtube.com/shorts/" in url:
+        return True
+    if duration is not None:
+        try:
+            return int(duration) <= 60
+        except Exception:
+            return False
+    return False
+
+
 def scrape_channel(
     channel_url: str,
-    content_type: str,
-    max_videos: int = 25,
+    content_type: str = "shorts",       # 'shorts' | 'longform' | 'both'
+    scan_limit: Optional[int] = 800,     # how many videos to *check* for view_count
+    min_views: int = 300_000,            # include only videos above this
+    max_results: int = 200,              # cap output size
     language: Optional[str] = None,
     allow_auto: bool = True,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict]:
-    if content_type not in {"shorts", "longform"}:
-        raise ValueError("content_type must be 'shorts' or 'longform'")
+    """
+    Scans a channel, checks view counts, and only pulls transcripts for videos meeting min_views.
+    Then ranks results by view_count descending.
+    """
+    if content_type not in {"shorts", "longform", "both"}:
+        raise ValueError("content_type must be 'shorts', 'longform', or 'both'")
 
     url = channel_url.strip()
+
+    # Extract a "flat" list of potential videos. We'll then fetch full metadata per video (view_count).
+    # Overfetch a bit because filtering by shorts/longform may drop some entries.
+    playlistend = None
+    if scan_limit is not None:
+        playlistend = int(scan_limit) * 3
 
     ydl_opts_list = {
         "quiet": True,
         "skip_download": True,
         "extract_flat": True,
-        "playlistend": int(max_videos) * 3,  # overfetch then filter
         "nocheckcertificate": True,
     }
+    if playlistend is not None:
+        ydl_opts_list["playlistend"] = playlistend
 
     entries = []
     with yt_dlp.YoutubeDL(ydl_opts_list) as ydl:
@@ -88,68 +115,101 @@ def scrape_channel(
         else:
             entries = [info]
 
-    normalized = []
+    # Normalize candidates (id, title, url, duration)
+    candidates = []
+    seen = set()
     for e in entries:
         if not e:
             continue
+
         vurl = e.get("url") or e.get("webpage_url")
         if vurl and not vurl.startswith("http"):
             vurl = f"https://www.youtube.com/watch?v={vurl}"
 
-        title = e.get("title") or ""
         vid = extract_video_id(vurl or "") or e.get("id")
-        if not vid:
+        if not vid or vid in seen:
             continue
+        seen.add(vid)
 
-        is_shorts = False
-        if vurl and "youtube.com/shorts/" in vurl:
-            is_shorts = True
-        dur = e.get("duration")
-        if dur is not None and dur <= 60:
-            is_shorts = True
+        title = e.get("title") or ""
+        duration = e.get("duration")
 
+        candidates.append({"id": vid, "title": title, "url": vurl, "duration": duration})
+
+    # Apply a *pre-filter* by content type using URL/duration hints (best-effort)
+    filtered = []
+    for c in candidates:
+        is_shorts = _is_shorts_candidate(c.get("url") or "", c.get("duration"))
         if content_type == "shorts" and not is_shorts:
             continue
         if content_type == "longform" and is_shorts:
             continue
+        filtered.append(c)
 
-        normalized.append({"id": vid, "title": title, "url": vurl})
-        if len(normalized) >= max_videos:
-            break
+    # Respect scan_limit after filtering (scan_limit is how many we actually check)
+    if scan_limit is not None:
+        filtered = filtered[: int(scan_limit)]
 
-    total = len(normalized)
-    results = []
+    total = len(filtered)
+    results: List[Dict] = []
 
-    ydl_opts_video = {"quiet": True, "skip_download": True, "nocheckcertificate": True}
+    ydl_opts_video = {
+        "quiet": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+    }
 
-    for i, item in enumerate(normalized, start=1):
+    for i, item in enumerate(filtered, start=1):
         if progress_cb:
-            progress_cb(i - 1, total, f"Fetching metadata & transcript ({i}/{total})...")
+            progress_cb(i - 1, total, f"Checking views ({i}/{total})… qualifying: {len(results)}")
 
         vid = item["id"]
-        vurl = item["url"] or f"https://www.youtube.com/watch?v={vid}"
+        vurl = item.get("url") or f"https://www.youtube.com/watch?v={vid}"
 
-        title = item["title"]
+        title = item.get("title") or ""
         view_count = None
+        canonical_url = vurl
 
+        # Fetch metadata to get view_count (required for min_views filter)
         try:
             with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
                 vinfo = ydl.extract_info(vurl, download=False)
                 if vinfo:
                     title = vinfo.get("title") or title
                     view_count = vinfo.get("view_count")
-                    vurl = vinfo.get("webpage_url") or vurl
+                    canonical_url = vinfo.get("webpage_url") or canonical_url
         except Exception:
-            pass
+            # If we can't get views, skip (can't verify >= min_views)
+            continue
 
+        if view_count is None or int(view_count) < int(min_views):
+            continue
+
+        # Only now fetch transcript (saves time)
         transcript = get_transcript(vid, language=language, allow_auto=allow_auto)
 
         results.append(
-            {"title": title, "url": vurl, "video_id": vid, "view_count": view_count, "transcript": transcript}
+            {
+                "title": title,
+                "url": canonical_url,
+                "video_id": vid,
+                "view_count": int(view_count) if view_count is not None else None,
+                "transcript": transcript,
+            }
         )
 
-        time.sleep(0.15)
+        # Stop early once we've collected enough results (still "across channel" within scan_limit)
+        if len(results) >= int(max_results):
+            break
+
+        time.sleep(0.15)  # gentle throttle
+
+    # Rank + sort
+    results.sort(key=lambda r: (r.get("view_count") or 0), reverse=True)
+    for idx, r in enumerate(results, start=1):
+        r["rank"] = idx
 
     if progress_cb:
-        progress_cb(total, total, "Complete.")
+        progress_cb(total, total, f"Complete. Returning {len(results)} ranked result(s).")
+
     return results
