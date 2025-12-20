@@ -5,15 +5,15 @@ from scraper import scrape_channel, normalize_channel_url
 st.set_page_config(page_title="YouTube Transcript + Metadata Scraper", layout="wide")
 
 st.title("YouTube Transcript + Metadata Scraper")
-st.caption("Fetch top videos (by views) and export metadata + transcripts to CSV. Best results on Streamlit Cloud require a YouTube Data API key; transcripts may require cookies for some channels/videos.")
+st.caption("Fast mode: uses YouTube Data API for view counts + sorting. Then fetches transcripts only for qualifying videos.")
 
 with st.sidebar:
     st.header("Inputs")
 
     yt_api_key = st.text_input(
-        "YouTube Data API v3 Key (recommended)",
+        "YouTube Data API v3 Key (required for fast results)",
         type="password",
-        help="If provided, the app fetches reliable view counts + full metadata and sorts by views.",
+        help="This app uses the API key to pull view counts + metadata quickly. Without it, runs can be slow or return 0 on Streamlit Cloud.",
     )
 
     cookies_file = st.file_uploader(
@@ -39,24 +39,16 @@ with st.sidebar:
         max_value=5000,
         value=800,
         step=50,
-        help="Higher can find more qualifying videos but takes longer. With API key we will scan up to this many items from uploads.",
-    )
-
-    popular_first = st.checkbox(
-        "Popular-first (only used when NO API key)",
-        value=True,
-        help="When no API key is provided, the scraper tries to start from YouTube's Popular sort URL.",
-    )
-
-    early_stop = st.checkbox(
-        "Early-stop when views drop (only used with Popular-first)",
-        value=True,
-        help="Stops after several consecutive videos below min views. Disable if you suspect ordering is wrong.",
+        help="Higher can find more qualifying videos.",
     )
 
 run = st.button("Start scraping", type="primary")
 
 if run:
+    if not yt_api_key.strip():
+        st.error("Please paste a YouTube Data API v3 key. Without it, runs can be very slow and often return 0 results on Streamlit Cloud.")
+        st.stop()
+
     if not channel_url.strip():
         st.error("Please enter a channel URL.")
         st.stop()
@@ -64,18 +56,24 @@ if run:
     norm = normalize_channel_url(channel_url.strip())
     st.write(f"Normalized channel URL: {norm}")
 
-    with st.spinner("Scraping…"):
-        rows, debug = scrape_channel(
-            channel_url=norm,
-            youtube_api_key=(yt_api_key.strip() or None),
-            cookies_txt_bytes=cookies_bytes,
-            content_type=content_type,
-            min_views=int(min_views),
-            max_results=int(max_results),
-            scan_limit=int(scan_limit),
-            popular_first=bool(popular_first),
-            early_stop=bool(early_stop),
-        )
+    progress = st.progress(0)
+    status = st.empty()
+
+    def on_progress(i, n, msg):
+        if n > 0:
+            progress.progress(min(1.0, i / n))
+        status.write(msg)
+
+    rows, debug = scrape_channel(
+        channel_url=norm,
+        youtube_api_key=yt_api_key.strip(),
+        cookies_txt_bytes=cookies_bytes,
+        content_type=content_type,
+        min_views=int(min_views),
+        max_results=int(max_results),
+        scan_limit=int(scan_limit),
+        on_progress=on_progress,
+    )
 
     st.success(f"Done. Returning {len(rows)} video(s).")
 
@@ -83,19 +81,13 @@ if run:
         st.code("\n".join(debug))
 
     if not rows:
-        st.warning("No qualifying videos returned. If you used min_views, try lowering it, increasing scan_limit, and make sure you provided a YouTube API key.")
+        st.warning("Returned 0 videos. Lower min_views and/or increase scan_limit. Also verify the channel URL resolves correctly.")
         st.stop()
 
     df = pd.DataFrame(rows)
-
-    cols = list(df.columns)
-    for c in ["rank", "view_count", "title", "url", "publishedAt", "transcript", "transcript_error"]:
-        if c in cols:
-            cols.remove(c)
-    ordered = [c for c in ["rank", "view_count", "title", "url", "publishedAt", "transcript", "transcript_error"] if c in df.columns] + cols
+    preferred = ["rank","view_count","title","url","publishedAt","duration_seconds","like_count","comment_count","channelTitle","channelId","tags","thumbnail","transcript","transcript_error"]
+    ordered = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
     df = df[ordered]
 
     st.dataframe(df, use_container_width=True, height=520)
-
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv_bytes, file_name="channel_videos_with_transcripts.csv", mime="text/csv")
+    st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"), file_name="channel_videos_with_transcripts.csv", mime="text/csv")
