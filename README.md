@@ -1,26 +1,19 @@
-# YouTube Transcript Scraper (Web App) — Ranked + View Filter
+# v9 — Exports full metadata + transcript
 
-This **Streamlit** app:
-- Scans a YouTube channel (Shorts, Longform, or Both)
-- Filters to videos with **>= minimum views** (default 300,000)
-- Pulls **transcripts** for qualifying videos
-- Ranks results by **view_count**
-- Lets you download a **ranked CSV**
+Adds CSV columns similar to YouTube Data API snippet data:
+- publishedAt (UTC, best-effort)
+- channelId / channelTitle
+- title, tags, categories
+- defaultLanguage / defaultAudioLanguage (best-effort)
+- thumbnail URLs (default/medium/high/standard/maxres)
 
-## Run locally
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
+Still supports Popular-first + early stop + transcript fallback (captions → audio transcription).
+
+## Streamlit Secrets
+Add in Streamlit Cloud → Settings → Secrets:
+```
+OPENAI_API_KEY = "YOUR_KEY"
 ```
 
-## Deploy online (Streamlit Community Cloud)
-1. Push this folder to a GitHub repo.
-2. In Streamlit Community Cloud, create a new app (main file: `app.py`).
-3. Deploy.
-
-## Notes / Limits
-- View counts require per-video metadata calls. Scanning an entire large channel can take time.
-- Start with a smaller "Max videos to scan" (e.g., 300–800), then increase.
-- Some videos have transcripts disabled or unavailable.
+## Notes
+`categoryId` is usually only available via the official YouTube Data API; yt-dlp provides `categories` more reliably.

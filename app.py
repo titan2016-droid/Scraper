@@ -1,48 +1,85 @@
 import streamlit as st
-from scraper import scrape_channel
+from scraper import scrape_channel, normalize_channel_url
 import pandas as pd
 import time
+import tempfile
+import os
 
 st.set_page_config(page_title="YouTube Transcript Scraper", page_icon="🎬", layout="wide")
 
-st.title("🎬 YouTube Transcript Scraper (Channel → Ranked CSV)")
-st.caption("Filters a channel to videos above a view threshold, pulls transcripts, ranks results, and lets you download a CSV.")
+st.title("🎬 YouTube Transcript Scraper — Popular-first + Transcripts + Full Metadata")
+st.caption("Filters 300k+ views, ranks results, and outputs **video metadata + transcript** in one CSV.")
 
 with st.sidebar:
     st.header("Channel")
-    channel_url = st.text_input("YouTube channel URL", placeholder="https://www.youtube.com/@davisfacts")
+    channel_url_in = st.text_input("YouTube channel URL", placeholder="https://www.youtube.com/@davisfacts (no /shorts)")
     content_type = st.selectbox("Content type", ["shorts", "longform", "both"], index=0)
 
     st.divider()
+    st.header("Scan Strategy")
+    popular_first = st.checkbox("Start from 'Popular' order", value=True)
+    early_stop = st.checkbox("Stop scanning when views drop below minimum", value=True)
+
+    st.divider()
     st.header("Filter + Ranking")
-    min_views = st.number_input("Minimum views", min_value=0, value=300_000, step=10_000, help="Only videos with view_count >= this will be included.")
-    rank_by = st.selectbox("Rank by", ["view_count"], index=0)
+    min_views = st.number_input("Minimum views", min_value=0, value=300_000, step=10_000)
+    max_results = st.number_input("Max results to output", min_value=1, max_value=5_000, value=150, step=25)
 
     st.divider()
     st.header("Scope")
-    scrape_entire = st.checkbox("Scan entire channel (can take a while)", value=False)
-    scan_limit = st.number_input("Max videos to scan", min_value=1, max_value=50_000, value=800, step=50,
-                                help="How many videos to *check* across the channel. Increase for big channels.")
-    max_results = st.number_input("Max results to output", min_value=1, max_value=5_000, value=200, step=25,
-                                 help="How many qualifying videos to include in the CSV after filtering.")
+    scan_limit = st.number_input("Max videos to scan", min_value=1, max_value=50_000, value=600, step=50)
 
     st.divider()
-    st.header("Transcript")
-    language = st.text_input("Transcript language (optional)", value="", help="Example: en. Leave blank to use default when available.")
-    include_auto = st.checkbox("Allow auto-generated transcripts", value=True)
+    st.header("Transcript method")
+    method = st.radio(
+        "How should we get transcripts?",
+        ["Auto (Captions → Audio Transcribe)", "Captions only", "Audio transcribe only"],
+        index=0,
+    )
+    model = st.selectbox("Audio transcription model", ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"], index=0)
+    st.caption("For audio transcription, set OPENAI_API_KEY in Streamlit Secrets.")
 
     st.divider()
-    run_btn = st.button("🚀 Scrape + Rank")
+    st.header("Captions options")
+    language = st.text_input("Preferred caption language (optional)", value="", help="Example: en (used for captions).")
+    include_auto = st.checkbox("Allow auto-generated captions", value=True)
+
+    st.divider()
+    st.header("Output")
+    show_errors = st.checkbox("Include transcript error details in CSV", value=True)
+    include_raw_description = st.checkbox("Include full description column", value=False, help="Descriptions can be long; leaving off keeps CSV lighter.")
+
+    st.divider()
+    st.header("Cookies (optional)")
+    cookies_file = st.file_uploader("Upload cookies.txt", type=["txt"])
+
+    st.divider()
+    run_btn = st.button("🚀 Scrape + Export CSV")
+
+if channel_url_in.strip():
+    normalized = normalize_channel_url(channel_url_in.strip())
+    if normalized != channel_url_in.strip():
+        st.warning(f"Normalized channel URL to: {normalized}")
+
+cookies_path = None
+tmp_dir = None
+if cookies_file is not None:
+    tmp_dir = tempfile.mkdtemp(prefix="ytcookies_")
+    cookies_path = os.path.join(tmp_dir, "cookies.txt")
+    with open(cookies_path, "wb") as f:
+        f.write(cookies_file.getbuffer())
 
 st.info(
-    "Tip: Use the channel *root* URL (e.g., `https://www.youtube.com/@name`) even if you're scanning Shorts. "
-    "Scanning an entire large channel may hit hosting time limits—start with a smaller scan limit, then increase."
+    "This version exports metadata like published date, channel ID, tags, languages, and thumbnail URLs "
+    "alongside views + transcript."
 )
 
 if run_btn:
-    if not channel_url.strip():
+    if not channel_url_in.strip():
         st.error("Please enter a channel URL.")
         st.stop()
+
+    channel_url = normalize_channel_url(channel_url_in.strip())
 
     st.write("### Progress")
     prog = st.progress(0)
@@ -54,51 +91,84 @@ if run_btn:
             prog.progress(min(1.0, i / total))
         status.text(msg)
 
-    try:
-        rows = scrape_channel(
-            channel_url=channel_url.strip(),
-            content_type=content_type,
-            scan_limit=None if scrape_entire else int(scan_limit),
-            min_views=int(min_views),
-            max_results=int(max_results),
-            language=language.strip() or None,
-            allow_auto=include_auto,
-            progress_cb=on_progress,
-        )
-    except Exception as e:
-        st.exception(e)
-        st.stop()
+    rows, debug = scrape_channel(
+        channel_url=channel_url,
+        content_type=content_type,
+        scan_limit=int(scan_limit),
+        min_views=int(min_views),
+        max_results=int(max_results),
+        language=language.strip() or None,
+        allow_auto=include_auto,
+        include_error_details=show_errors,
+        cookiefile=cookies_path,
+        popular_first=popular_first,
+        early_stop=early_stop,
+        transcript_mode=method,
+        openai_model=model,
+        progress_cb=on_progress,
+        return_debug=True,
+        include_description=include_raw_description,
+    )
 
     elapsed = time.time() - start
-    status.text(f"Done. Found {len(rows)} qualifying video(s) in {elapsed:.1f}s.")
+    status.text(f"Done. Returning {len(rows)} video(s) in {elapsed:.1f}s.")
     prog.progress(1.0)
 
+    with st.expander("Debug (advanced)"):
+        st.code("\n".join(debug))
+
     if not rows:
-        st.warning("No qualifying videos found. Try lowering the minimum views, switching to 'both', or increasing scan limit.")
+        st.error("0 qualifying videos returned. Try increasing scan_limit, switching content type to 'both', or disabling Popular-first.")
         st.stop()
 
     df = pd.DataFrame(rows)
 
-    # Ensure nice column order
-    preferred = ["rank", "view_count", "title", "url", "video_id", "transcript"]
+    st.write("### Transcript status summary")
+    if "transcript_status" in df.columns:
+        st.dataframe(df["transcript_status"].value_counts().rename_axis("status").reset_index(name="count"),
+                     use_container_width=True, height=240)
+
+    preferred = [
+        "rank",
+        "view_count",
+        "like_count",
+        "comment_count",
+        "publishedAt",
+        "duration_seconds",
+        "is_short",
+        "title",
+        "video_id",
+        "url",
+        "channelTitle",
+        "channelId",
+        "uploader",
+        "tags",
+        "categories",
+        "categoryId",
+        "defaultLanguage",
+        "defaultAudioLanguage",
+        "thumbnail_default",
+        "thumbnail_medium",
+        "thumbnail_high",
+        "thumbnail_standard",
+        "thumbnail_maxres",
+        "transcript_method",
+        "transcript_source",
+        "transcript_format",
+        "transcript_status",
+        "transcript",
+        "transcript_error",
+    ]
     cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
     df = df[cols]
 
     st.write("### Preview")
-    st.dataframe(df, use_container_width=True, height=420)
+    st.dataframe(df, use_container_width=True, height=480)
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="⬇️ Download Ranked CSV",
+        label="⬇️ Download CSV",
         data=csv_bytes,
         file_name="channel_transcripts_ranked.csv",
         mime="text/csv"
     )
-
-    st.write("### Transcript Viewer")
-    options = [f"{r['rank']}. {r['title']} ({(r.get('view_count') or 0):,} views)" for r in rows]
-    choice = st.selectbox("Select a video", options)
-    chosen_rank = int(choice.split(".", 1)[0])
-    idx = next(i for i, r in enumerate(rows) if r.get("rank") == chosen_rank)
-    st.write("**Video URL:**", rows[idx]["url"])
-    st.text_area("Transcript", rows[idx].get("transcript") or "", height=260)

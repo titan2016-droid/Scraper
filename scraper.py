@@ -1,6 +1,14 @@
+import os
 import re
 import time
-from typing import Callable, Dict, List, Optional, Union
+import html
+import tempfile
+import datetime
+import xml.etree.ElementTree as ET
+from typing import Callable, Dict, List, Optional, Union, Tuple
+from urllib.request import Request, urlopen
+import http.cookiejar as cookiejar
+from urllib.parse import urlparse, urlunparse
 
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -8,8 +16,34 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
-    CouldNotRetrieveTranscript,
+    TooManyRequests,
 )
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+
+
+def normalize_channel_url(url: str) -> str:
+    u = url.strip()
+    if not u.startswith("http"):
+        u = "https://" + u.lstrip("/")
+    p = urlparse(u)
+    path = (p.path or "").rstrip("/")
+    for tab in ("/shorts", "/videos", "/streams", "/featured", "/playlists", "/community", "/about"):
+        if path.lower().endswith(tab):
+            path = path[: -len(tab)].rstrip("/")
+    return urlunparse((p.scheme, p.netloc, path, "", "", ""))
+
+
+def _join_url(base: str, suffix: str) -> str:
+    return base.rstrip("/") + suffix
+
+
+def _popular_url(channel_url: str, tab: str) -> str:
+    if tab == "videos":
+        return _join_url(channel_url, "/videos?view=0&sort=p&flow=grid")
+    if tab == "shorts":
+        return _join_url(channel_url, "/shorts?view=0&sort=p&flow=grid")
+    return channel_url
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -29,35 +63,223 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 
-def get_transcript(video_id: str, language: Optional[str], allow_auto: bool) -> str:
+def _clean_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_vtt(vtt: str) -> str:
+    lines = []
+    for line in vtt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("WEBVTT") or line.startswith("NOTE") or line.startswith("STYLE"):
+            continue
+        if re.match(r"^\d+$", line):
+            continue
+        if re.search(r"\d{1,2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}\.\d{3}", line):
+            continue
+        if re.search(r"\d{1,2}:\d{2}\.\d{3}\s*-->\s*\d{1,2}:\d{2}\.\d{3}", line):
+            continue
+        line = re.sub(r"<\d{1,2}:\d{2}:\d{2}\.\d{3}>", "", line)
+        line = re.sub(r"</?c[^>]*>", "", line)
+        line = re.sub(r"</?i>", "", line)
+        line = re.sub(r"</?b>", "", line)
+        line = html.unescape(line)
+        line = _clean_whitespace(line)
+        if line:
+            lines.append(line)
+    out, prev = [], None
+    for t in lines:
+        if t != prev:
+            out.append(t)
+        prev = t
+    return _clean_whitespace(" ".join(out))
+
+
+def _parse_srv3(xml_text: str) -> str:
     try:
-        if language:
-            segments = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
-            return "\n".join(s.get("text", "") for s in segments).strip()
-        segments = YouTubeTranscriptApi.get_transcript(video_id)
-        return "\n".join(s.get("text", "") for s in segments).strip()
-    except NoTranscriptFound:
-        if not allow_auto:
-            return ""
-        try:
-            tlist = YouTubeTranscriptApi.list_transcripts(video_id)
-            chosen = None
-            for t in tlist:
-                if not t.is_generated:
-                    chosen = t
-                    break
-            if chosen is None:
-                chosen = next(iter(tlist), None)
-            if chosen is None:
-                return ""
-            segments = chosen.fetch()
-            return "\n".join(s.get("text", "") for s in segments).strip()
-        except Exception:
-            return ""
-    except (TranscriptsDisabled, VideoUnavailable, CouldNotRetrieveTranscript):
-        return ""
+        root = ET.fromstring(xml_text)
+        parts = []
+        for node in root.iter():
+            if node.tag.lower().endswith("text") and node.text:
+                parts.append(html.unescape(node.text))
+        return _clean_whitespace(" ".join(parts))
     except Exception:
-        return ""
+        parts = re.findall(r"<text[^>]*>(.*?)</text>", xml_text, flags=re.DOTALL | re.IGNORECASE)
+        parts = [html.unescape(re.sub(r"<.*?>", "", p)) for p in parts]
+        return _clean_whitespace(" ".join(parts))
+
+
+def _parse_ttml(ttml_text: str) -> str:
+    try:
+        root = ET.fromstring(ttml_text)
+        parts = []
+        for node in root.iter():
+            if node.tag.lower().endswith("p"):
+                txt = "".join(node.itertext())
+                if txt:
+                    parts.append(html.unescape(txt))
+        return _clean_whitespace(" ".join(parts))
+    except Exception:
+        txt = re.sub(r"<.*?>", " ", ttml_text)
+        return _clean_whitespace(html.unescape(txt))
+
+
+def _download_text(url: str, cookiefile: Optional[str] = None) -> str:
+    cj = None
+    if cookiefile:
+        cj = cookiejar.MozillaCookieJar()
+        try:
+            cj.load(cookiefile, ignore_discard=True, ignore_expires=True)
+        except Exception:
+            cj = None
+
+    headers = {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.youtube.com/",
+    }
+    req = Request(url, headers=headers)
+    if cj is not None:
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        with opener.open(req, timeout=25) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    with urlopen(req, timeout=25) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def _pick_subtitle(info: Dict, language: Optional[str], allow_auto: bool) -> Tuple[Optional[str], str, Optional[str]]:
+    subs = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+
+    def pick(bucket: Dict, src_label: str) -> Optional[Tuple[str, str, str]]:
+        if not bucket:
+            return None
+        keys = list(bucket.keys())
+
+        def score_lang(k: str) -> int:
+            kl = k.lower()
+            if language and (kl == language.lower() or kl.startswith(language.lower() + "-")):
+                return 0
+            if kl in ("en", "en-us", "en-gb"):
+                return 1
+            return 2
+
+        keys.sort(key=score_lang)
+        ext_order = ["vtt", "ttml", "srv3", "srv1"]
+        for ext in ext_order:
+            for k in keys:
+                for fmt in bucket.get(k, []):
+                    if fmt.get("ext") == ext and fmt.get("url"):
+                        return fmt["url"], src_label, ext
+        for k in keys:
+            for fmt in bucket.get(k, []):
+                if fmt.get("url") and fmt.get("ext"):
+                    return fmt["url"], src_label, fmt.get("ext")
+        return None
+
+    got = pick(subs, "yt_dlp_subtitles_manual")
+    if got:
+        return got[0], got[1], got[2]
+    if allow_auto:
+        got = pick(auto, "yt_dlp_subtitles_auto")
+        if got:
+            return got[0], got[1], got[2]
+    return None, "none", None
+
+
+def _captions_transcript(video_id: str, vinfo: Dict, language: Optional[str], allow_auto: bool, cookiefile: Optional[str]) -> Tuple[str, str, str, str, str]:
+    transcript = ""
+    t_status = "not_found"
+    t_err = ""
+    t_source = "none"
+    t_fmt = ""
+
+    try:
+        sub_url, sub_source, fmt = _pick_subtitle(vinfo or {}, language=language, allow_auto=allow_auto)
+        if sub_url and fmt:
+            raw = _download_text(sub_url, cookiefile=cookiefile)
+            if fmt == "vtt":
+                transcript = _parse_vtt(raw)
+            elif fmt == "ttml":
+                transcript = _parse_ttml(raw)
+            elif fmt in ("srv3", "srv1"):
+                transcript = _parse_srv3(raw)
+            else:
+                transcript = _clean_whitespace(html.unescape(re.sub(r"<.*?>", " ", raw)))
+            t_fmt = fmt
+            t_source = sub_source
+            t_status = "ok" if transcript else "error"
+            if not transcript:
+                t_err = f"Downloaded {fmt} captions but parsed empty."
+    except Exception as e:
+        t_err = f"{type(e).__name__}: {e}"
+
+    if not transcript:
+        try:
+            if language:
+                segments = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
+            else:
+                segments = YouTubeTranscriptApi.get_transcript(video_id)
+            transcript = "\n".join(s.get("text", "") for s in segments).strip()
+            t_status = "ok" if transcript else "not_found"
+            t_source = "youtube_transcript_api"
+            t_fmt = "segments"
+        except TranscriptsDisabled as e:
+            t_status, t_source, t_fmt, t_err = "disabled", "youtube_transcript_api", "segments", str(e)
+        except VideoUnavailable as e:
+            t_status, t_source, t_fmt, t_err = "unavailable", "youtube_transcript_api", "segments", str(e)
+        except TooManyRequests as e:
+            t_status, t_source, t_fmt, t_err = "blocked", "youtube_transcript_api", "segments", str(e)
+        except NoTranscriptFound as e:
+            t_status, t_source, t_fmt, t_err = "not_found", "youtube_transcript_api", "segments", str(e)
+        except Exception as e:
+            t_status, t_source, t_fmt, t_err = "error", "youtube_transcript_api", "segments", f"{type(e).__name__}: {e}"
+
+    return transcript, t_status, t_source, t_fmt if t_fmt else "", t_err
+
+
+def _download_audio_for_transcription(video_url: str, cookiefile: Optional[str]) -> Tuple[Optional[str], str]:
+    tmpdir = tempfile.mkdtemp(prefix="ytaudio_")
+    outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+    fmt = "bestaudio[filesize<25M]/bestaudio[ext=m4a][filesize<25M]/bestaudio[ext=webm][filesize<25M]/worstaudio/worstaudio[ext=m4a]/worstaudio[ext=webm]"
+
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": False,
+        "nocheckcertificate": True,
+        "outtmpl": outtmpl,
+        "format": fmt,
+        "noplaylist": True,
+    }
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            vid = info.get("id")
+            for name in os.listdir(tmpdir):
+                if vid and name.startswith(vid + "."):
+                    path = os.path.join(tmpdir, name)
+                    if os.path.getsize(path) > 25 * 1024 * 1024:
+                        return None, f"audio_too_large ({os.path.getsize(path)/1024/1024:.1f}MB)"
+                    return path, "ok"
+            return None, "audio_not_found"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _openai_transcribe(audio_path: str, model: str) -> Tuple[str, str]:
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        with open(audio_path, "rb") as f:
+            tr = client.audio.transcriptions.create(model=model, file=f)
+        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else "")
+        return (text or "").strip(), ""
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"
 
 
 def _is_shorts_candidate(url: str, duration: Optional[Union[int, float]]) -> bool:
@@ -71,72 +293,132 @@ def _is_shorts_candidate(url: str, duration: Optional[Union[int, float]]) -> boo
     return False
 
 
+def _get_list_url(channel_url: str, content_type: str, popular_first: bool) -> List[str]:
+    if not popular_first:
+        return [channel_url]
+    urls = []
+    if content_type in ("longform", "both"):
+        urls.append(_popular_url(channel_url, "videos"))
+    if content_type in ("shorts", "both"):
+        urls.append(_popular_url(channel_url, "shorts"))
+    return urls or [channel_url]
+
+
+def _iso_published_at(vinfo: Dict) -> str:
+    ts = vinfo.get("timestamp")
+    if ts:
+        try:
+            return datetime.datetime.utcfromtimestamp(int(ts)).replace(microsecond=0).isoformat() + "Z"
+        except Exception:
+            pass
+    ud = vinfo.get("upload_date") or vinfo.get("release_date")
+    if ud and re.match(r"^\d{8}$", str(ud)):
+        y, m, d = str(ud)[:4], str(ud)[4:6], str(ud)[6:8]
+        return f"{y}-{m}-{d}T00:00:00Z"
+    return ""
+
+
+def _thumbnail_urls(vinfo: Dict, video_id: str) -> Dict[str, str]:
+    thumbs = vinfo.get("thumbnails") or []
+    fallback = {
+        "thumbnail_default": f"https://i.ytimg.com/vi/{video_id}/default.jpg",
+        "thumbnail_medium": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+        "thumbnail_high": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        "thumbnail_standard": f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
+        "thumbnail_maxres": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+    }
+    if not thumbs:
+        return fallback
+
+    def w(t): 
+        return t.get("width") or 0
+    thumbs_sorted = sorted([t for t in thumbs if t.get("url")], key=w)
+    if not thumbs_sorted:
+        return fallback
+
+    max_url = thumbs_sorted[-1]["url"]
+
+    def pick_closest(target_w: int) -> str:
+        best = None
+        best_diff = 10**18
+        for t in thumbs_sorted:
+            tw = t.get("width") or 0
+            diff = abs(tw - target_w)
+            if diff < best_diff:
+                best = t.get("url")
+                best_diff = diff
+        return best or ""
+
+    return {
+        "thumbnail_default": pick_closest(120) or thumbs_sorted[0]["url"],
+        "thumbnail_medium": pick_closest(320) or thumbs_sorted[0]["url"],
+        "thumbnail_high": pick_closest(480) or thumbs_sorted[0]["url"],
+        "thumbnail_standard": pick_closest(640) or max_url,
+        "thumbnail_maxres": max_url,
+    }
+
+
 def scrape_channel(
     channel_url: str,
-    content_type: str = "shorts",       # 'shorts' | 'longform' | 'both'
-    scan_limit: Optional[int] = 800,     # how many videos to *check* for view_count
-    min_views: int = 300_000,            # include only videos above this
-    max_results: int = 200,              # cap output size
+    content_type: str = "shorts",
+    scan_limit: int = 600,
+    min_views: int = 300_000,
+    max_results: int = 150,
     language: Optional[str] = None,
     allow_auto: bool = True,
+    include_error_details: bool = True,
+    cookiefile: Optional[str] = None,
+    popular_first: bool = True,
+    early_stop: bool = True,
+    transcript_mode: str = "Auto (Captions → Audio Transcribe)",
+    openai_model: str = "gpt-4o-mini-transcribe",
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
-) -> List[Dict]:
-    """
-    Scans a channel, checks view counts, and only pulls transcripts for videos meeting min_views.
-    Then ranks results by view_count descending.
-    """
-    if content_type not in {"shorts", "longform", "both"}:
-        raise ValueError("content_type must be 'shorts', 'longform', or 'both'")
-
-    url = channel_url.strip()
-
-    # Extract a "flat" list of potential videos. We'll then fetch full metadata per video (view_count).
-    # Overfetch a bit because filtering by shorts/longform may drop some entries.
-    playlistend = None
-    if scan_limit is not None:
-        playlistend = int(scan_limit) * 3
+    return_debug: bool = False,
+    include_description: bool = False,
+) -> Tuple[List[Dict], List[str]]:
+    debug = []
+    channel_url = normalize_channel_url(channel_url)
+    debug.append(f"Normalized channel URL: {channel_url}")
+    list_urls = _get_list_url(channel_url, content_type, popular_first)
+    debug.append("Listing URLs:")
+    debug.extend(list_urls)
 
     ydl_opts_list = {
         "quiet": True,
         "skip_download": True,
         "extract_flat": True,
         "nocheckcertificate": True,
+        "playlistend": int(scan_limit) * 3,
     }
-    if playlistend is not None:
-        ydl_opts_list["playlistend"] = playlistend
+    if cookiefile:
+        ydl_opts_list["cookiefile"] = cookiefile
 
-    entries = []
-    with yt_dlp.YoutubeDL(ydl_opts_list) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if not info:
-            return []
-        if "entries" in info and info["entries"]:
-            entries = list(info["entries"])
-        else:
-            entries = [info]
-
-    # Normalize candidates (id, title, url, duration)
     candidates = []
     seen = set()
-    for e in entries:
-        if not e:
+    for lurl in list_urls:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts_list) as ydl:
+                info = ydl.extract_info(lurl, download=False)
+        except Exception as e:
+            debug.append(f"List extraction failed for {lurl}: {type(e).__name__}: {e}")
             continue
-
-        vurl = e.get("url") or e.get("webpage_url")
-        if vurl and not vurl.startswith("http"):
-            vurl = f"https://www.youtube.com/watch?v={vurl}"
-
-        vid = extract_video_id(vurl or "") or e.get("id")
-        if not vid or vid in seen:
+        if not info:
+            debug.append(f"No info returned for {lurl}")
             continue
-        seen.add(vid)
+        entries = list(info.get("entries") or [])
+        debug.append(f"Entries from {lurl}: {len(entries)}")
+        for e in entries:
+            if not e:
+                continue
+            vurl = e.get("url") or e.get("webpage_url")
+            if vurl and not vurl.startswith("http"):
+                vurl = f"https://www.youtube.com/watch?v={vurl}"
+            vid = extract_video_id(vurl or "") or e.get("id")
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            candidates.append({"id": vid, "title": e.get("title") or "", "url": vurl, "duration": e.get("duration")})
 
-        title = e.get("title") or ""
-        duration = e.get("duration")
-
-        candidates.append({"id": vid, "title": title, "url": vurl, "duration": duration})
-
-    # Apply a *pre-filter* by content type using URL/duration hints (best-effort)
     filtered = []
     for c in candidates:
         is_shorts = _is_shorts_candidate(c.get("url") or "", c.get("duration"))
@@ -146,22 +428,20 @@ def scrape_channel(
             continue
         filtered.append(c)
 
-    # Respect scan_limit after filtering (scan_limit is how many we actually check)
-    if scan_limit is not None:
-        filtered = filtered[: int(scan_limit)]
-
+    filtered = filtered[: int(scan_limit)]
     total = len(filtered)
-    results: List[Dict] = []
+    debug.append(f"Candidates after type filter: {total}")
 
-    ydl_opts_video = {
-        "quiet": True,
-        "skip_download": True,
-        "nocheckcertificate": True,
-    }
+    ydl_opts_video = {"quiet": True, "skip_download": True, "nocheckcertificate": True}
+    if cookiefile:
+        ydl_opts_video["cookiefile"] = cookiefile
+
+    results: List[Dict] = []
+    below_streak = 0
 
     for i, item in enumerate(filtered, start=1):
         if progress_cb:
-            progress_cb(i - 1, total, f"Checking views ({i}/{total})… qualifying: {len(results)}")
+            progress_cb(i - 1, total, f"Checking views + transcript ({i}/{total})… qualifying: {len(results)}")
 
         vid = item["id"]
         vurl = item.get("url") or f"https://www.youtube.com/watch?v={vid}"
@@ -169,8 +449,8 @@ def scrape_channel(
         title = item.get("title") or ""
         view_count = None
         canonical_url = vurl
+        vinfo = None
 
-        # Fetch metadata to get view_count (required for min_views filter)
         try:
             with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
                 vinfo = ydl.extract_info(vurl, download=False)
@@ -179,32 +459,117 @@ def scrape_channel(
                     view_count = vinfo.get("view_count")
                     canonical_url = vinfo.get("webpage_url") or canonical_url
         except Exception:
-            # If we can't get views, skip (can't verify >= min_views)
             continue
 
-        if view_count is None or int(view_count) < int(min_views):
+        if view_count is None:
             continue
 
-        # Only now fetch transcript (saves time)
-        transcript = get_transcript(vid, language=language, allow_auto=allow_auto)
+        if int(view_count) < int(min_views):
+            if popular_first and early_stop:
+                below_streak += 1
+                if below_streak >= 8:
+                    debug.append("Early stop: consecutive videos below min_views.")
+                    break
+            continue
+        else:
+            below_streak = 0
 
-        results.append(
-            {
-                "title": title,
-                "url": canonical_url,
-                "video_id": vid,
-                "view_count": int(view_count) if view_count is not None else None,
-                "transcript": transcript,
-            }
-        )
+        publishedAt = _iso_published_at(vinfo or {})
+        channelId = (vinfo.get("channel_id") or vinfo.get("uploader_id") or "")
+        channelTitle = (vinfo.get("channel") or vinfo.get("uploader") or "")
+        uploader = (vinfo.get("uploader") or "")
+        tags = vinfo.get("tags") or []
+        categories = vinfo.get("categories") or []
+        categoryId = vinfo.get("category_id") or ""
+        defaultLanguage = vinfo.get("language") or vinfo.get("default_language") or ""
+        defaultAudioLanguage = vinfo.get("audio_language") or vinfo.get("default_audio_language") or ""
 
-        # Stop early once we've collected enough results (still "across channel" within scan_limit)
+        duration_seconds = vinfo.get("duration")
+        is_short = _is_shorts_candidate(canonical_url, duration_seconds)
+
+        thumbs = _thumbnail_urls(vinfo or {}, video_id=vid)
+
+        like_count = vinfo.get("like_count")
+        comment_count = vinfo.get("comment_count")
+
+        transcript = ""
+        t_status = "not_found"
+        t_err = ""
+        t_source = "none"
+        t_fmt = ""
+        t_method = ""
+
+        mode = transcript_mode
+
+        if mode == "Captions only":
+            transcript, t_status, t_source, t_fmt, t_err = _captions_transcript(vid, vinfo or {}, language, allow_auto, cookiefile)
+            t_method = "captions"
+        elif mode == "Audio transcribe only":
+            t_method = "audio_transcribe"
+        else:
+            transcript, t_status, t_source, t_fmt, t_err = _captions_transcript(vid, vinfo or {}, language, allow_auto, cookiefile)
+            t_method = "captions_then_audio"
+            if t_status != "ok" or not transcript:
+                transcript = ""
+
+        if (mode == "Audio transcribe only") or (mode == "Auto (Captions → Audio Transcribe)" and not transcript):
+            audio_path, a_status = _download_audio_for_transcription(canonical_url, cookiefile)
+            t_method = "audio_transcribe"
+            if a_status != "ok" or not audio_path:
+                t_status = "audio_download_failed"
+                t_source = "yt_dlp_audio"
+                t_err = a_status
+            else:
+                text, err = _openai_transcribe(audio_path, model=openai_model)
+                t_source = "openai_audio_transcriptions"
+                t_fmt = "text"
+                if text:
+                    transcript = text
+                    t_status = "ok"
+                    t_err = ""
+                else:
+                    t_status = "audio_transcribe_failed"
+                    t_err = err or "empty_transcript"
+
+        row = {
+            "title": title,
+            "url": canonical_url,
+            "video_id": vid,
+            "view_count": int(view_count),
+            "like_count": int(like_count) if isinstance(like_count, int) else like_count,
+            "comment_count": int(comment_count) if isinstance(comment_count, int) else comment_count,
+            "publishedAt": publishedAt,
+            "duration_seconds": duration_seconds,
+            "is_short": bool(is_short),
+            "channelTitle": channelTitle,
+            "channelId": channelId,
+            "uploader": uploader,
+            "tags": "|".join(tags) if isinstance(tags, list) else (tags or ""),
+            "categories": "|".join(categories) if isinstance(categories, list) else (categories or ""),
+            "categoryId": categoryId,
+            "defaultLanguage": defaultLanguage,
+            "defaultAudioLanguage": defaultAudioLanguage,
+            **thumbs,
+            "transcript_method": t_method,
+            "transcript_source": t_source,
+            "transcript_format": t_fmt,
+            "transcript_status": t_status,
+            "transcript": transcript,
+        }
+
+        if include_description:
+            row["description"] = (vinfo.get("description") or "")
+
+        if include_error_details:
+            row["transcript_error"] = t_err
+
+        results.append(row)
+
         if len(results) >= int(max_results):
             break
 
-        time.sleep(0.15)  # gentle throttle
+        time.sleep(0.25)
 
-    # Rank + sort
     results.sort(key=lambda r: (r.get("view_count") or 0), reverse=True)
     for idx, r in enumerate(results, start=1):
         r["rank"] = idx
@@ -212,4 +577,4 @@ def scrape_channel(
     if progress_cb:
         progress_cb(total, total, f"Complete. Returning {len(results)} ranked result(s).")
 
-    return results
+    return (results, debug) if return_debug else (results, [])
