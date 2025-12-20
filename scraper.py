@@ -1,5 +1,6 @@
 import re
 import time
+import json
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -141,7 +142,137 @@ def _is_short(duration_seconds: Optional[int]) -> bool:
     return int(duration_seconds) <= 60
 
 
+def _clean_vtt(text: str) -> str:
+    '''
+    Convert VTT caption file into plain transcript.
+    Removes timestamps/metadata and joins caption lines.
+    '''
+    lines = []
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.upper().startswith("WEBVTT"):
+            continue
+        # timestamps like: 00:00:00.000 --> 00:00:01.000
+        if "-->" in s:
+            continue
+        # cue settings / numeric cue ids
+        if re.match(r"^\d+$", s):
+            continue
+        # strip basic tags
+        s = re.sub(r"<[^>]+>", "", s).strip()
+        if s:
+            lines.append(s)
+    # De-duplicate consecutive duplicates
+    out = []
+    prev = None
+    for s in lines:
+        if s == prev:
+            continue
+        out.append(s)
+        prev = s
+    return " ".join(out).strip()
+
+
+def _fetch_watch_html(video_id: str) -> str:
+    # Extra params sometimes bypass lightweight consent redirects
+    url = f"https://www.youtube.com/watch?v={video_id}&bpctr=9999999999&has_verified=1"
+    headers = {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    r = requests.get(url, headers=headers, timeout=25)
+    if r.status_code != 200:
+        return ""
+    return r.text or ""
+
+
+def _extract_caption_tracks_from_watch(html: str) -> List[Dict]:
+    '''
+    Try to find captionTracks in the watch HTML (ytInitialPlayerResponse).
+    Returns a list of track dicts (each includes baseUrl, languageCode, kind, name, etc).
+    '''
+    if not html:
+        return []
+    # Find: "captionTracks":[{...},...]
+    m = re.search(r'"captionTracks"\s*:\s*(\[[\s\S]*?\])\s*,\s*"audioTracks"', html)
+    if not m:
+        # Alternate end marker
+        m = re.search(r'"captionTracks"\s*:\s*(\[[\s\S]*?\])\s*,\s*"translationLanguages"', html)
+    if not m:
+        return []
+    arr_txt = m.group(1)
+    try:
+        tracks = json.loads(arr_txt)
+        if isinstance(tracks, list):
+            return tracks
+    except Exception:
+        return []
+    return []
+
+
+def _pick_caption_track(tracks: List[Dict], language: Optional[str]) -> Optional[Dict]:
+    if not tracks:
+        return None
+
+    # Prefer explicit language
+    if language:
+        for t in tracks:
+            if (t.get("languageCode") or "").lower().startswith(language.lower()):
+                return t
+
+    # Prefer English
+    for code in ["en", "en-US", "en-GB"]:
+        for t in tracks:
+            if (t.get("languageCode") or "").lower().startswith(code.lower()):
+                return t
+
+    # Otherwise first
+    return tracks[0]
+
+
+def _get_transcript_via_watch_html(video_id: str, language: Optional[str]) -> Tuple[str, str]:
+    '''
+    Fallback transcript method that mirrors the 'Show transcript' UI:
+    1) Fetch watch HTML
+    2) Extract captionTracks baseUrl
+    3) Download VTT and convert to plain text
+    '''
+    try:
+        html = _fetch_watch_html(video_id)
+        if not html:
+            return "", "WatchHTML:EmptyHTML"
+        tracks = _extract_caption_tracks_from_watch(html)
+        if not tracks:
+            return "", "WatchHTML:NoCaptionTracks"
+        track = _pick_caption_track(tracks, language)
+        if not track:
+            return "", "WatchHTML:NoTrackPicked"
+        base_url = track.get("baseUrl") or ""
+        if not base_url:
+            return "", "WatchHTML:NoBaseUrl"
+        # Ensure VTT
+        sep = "&" if "?" in base_url else "?"
+        vtt_url = base_url + ("" if "fmt=" in base_url else f"{sep}fmt=vtt")
+        r = requests.get(vtt_url, headers={"User-Agent": UA}, timeout=25)
+        if r.status_code != 200:
+            return "", f"WatchHTML:HTTP{r.status_code}"
+        txt = _clean_vtt(r.text or "")
+        if not txt:
+            return "", "WatchHTML:EmptyTranscript"
+        return txt, ""
+    except Exception as e:
+        return "", f"WatchHTML:{type(e).__name__}: {e}"
+
+
 def _get_transcript(video_id: str, language: Optional[str], allow_auto: bool) -> Tuple[str, str]:
+    '''
+    Transcript strategy:
+    1) Try youtube-transcript-api (fast when it works)
+    2) If missing/disabled, fall back to parsing YouTube watch HTML captionTracks and downloading VTT
+    '''
+    # 1) youtube-transcript-api
     try:
         if language:
             try:
@@ -167,18 +298,31 @@ def _get_transcript(video_id: str, language: Optional[str], allow_auto: bool) ->
             except Exception:
                 pass
 
-        return "", "No transcript found"
-    except TranscriptsDisabled:
-        return "", "TranscriptsDisabled"
-    except NoTranscriptFound:
-        return "", "NoTranscriptFound"
-    except TooManyRequests:
-        return "", "TooManyRequests"
-    except VideoUnavailable:
-        return "", "VideoUnavailable"
-    except Exception as e:
-        return "", f"{type(e).__name__}: {e}"
+        # Try any transcript available
+        try:
+            tr = next(iter(tl))
+            t = tr.fetch()
+            return " ".join(x.get("text", "") for x in t).strip(), ""
+        except Exception:
+            pass
 
+        err = "No transcript found"
+    except TranscriptsDisabled:
+        err = "TranscriptsDisabled"
+    except NoTranscriptFound:
+        err = "NoTranscriptFound"
+    except TooManyRequests:
+        err = "TooManyRequests"
+    except VideoUnavailable:
+        err = "VideoUnavailable"
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+
+    # 2) Fallback via watch HTML
+    txt, ferr = _get_transcript_via_watch_html(video_id, language)
+    if txt:
+        return txt, ""
+    return "", (ferr or err)
 
 def scrape_channel(
     channel_url: str,
