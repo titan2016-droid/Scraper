@@ -17,3 +17,7 @@ OPENAI_API_KEY = "YOUR_KEY"
 
 ## Notes
 `categoryId` is usually only available via the official YouTube Data API; yt-dlp provides `categories` more reliably.
+
+
+## v10 Hotfix
+If Streamlit shows an ImportError on `youtube_transcript_api._errors`, update to v10. This version is compatible with multiple youtube-transcript-api layouts and pins the dependency.

@@ -11,14 +11,32 @@ import http.cookiejar as cookiejar
 from urllib.parse import urlparse, urlunparse
 
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-    TooManyRequests,
-)
 
+# youtube-transcript-api has changed internal error module paths across versions.
+# We avoid hard-failing imports by trying multiple locations and falling back to generic Exceptions.
+from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
+
+try:
+    from youtube_transcript_api._errors import (  # type: ignore
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        VideoUnavailable,
+        TooManyRequests,
+    )
+except Exception:
+    try:
+        # Some versions expose these at package root
+        from youtube_transcript_api import (  # type: ignore
+            TranscriptsDisabled,
+            NoTranscriptFound,
+            VideoUnavailable,
+            TooManyRequests,
+        )
+    except Exception:
+        class TranscriptsDisabled(Exception): ...
+        class NoTranscriptFound(Exception): ...
+        class VideoUnavailable(Exception): ...
+        class TooManyRequests(Exception): ...
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 
 
