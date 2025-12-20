@@ -9,3 +9,8 @@ Includes transcript + transcript_error so you can see why a transcript is missin
 
 ## v16
 Adds transcript fallback that parses YouTube watch HTML captionTracks and downloads VTT (closer to 'Show transcript' behavior).
+
+
+## Cookies (recommended for transcripts)
+
+If transcripts come back empty or disabled, upload a `cookies.txt` exported from your browser. This lets the app fetch captions the same way your browser does.

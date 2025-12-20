@@ -15,6 +15,12 @@ with st.sidebar:
         type="password",
         help="Needed for reliable view counts + metadata + sorting by views (Popular-first).",
     )
+
+cookies_file = st.file_uploader(
+    "Optional: cookies.txt (recommended for transcripts)",
+    type=["txt"],
+    help="Some transcripts are blocked for server IPs. Upload a cookies.txt exported from your browser to fetch transcripts more reliably.",
+)
     channel_url = st.text_input("YouTube Channel URL", value="https://www.youtube.com/@davisfacts")
     content_type = st.selectbox("Content type", ["shorts", "longform", "both"], index=0)
     min_views = st.number_input("Minimum views", min_value=0, value=300000, step=10000)
@@ -52,6 +58,7 @@ if run_btn:
 
     rows, debug = scrape_channel(
         channel_url=channel_url,
+        cookies_txt=(cookies_file.getvalue() if cookies_file else None),
         youtube_api_key=(yt_api_key.strip() or None),
         content_type=content_type,
         scan_limit=int(scan_limit),

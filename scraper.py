@@ -5,6 +5,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+import yt_dlp
+import tempfile
+import html
 from youtube_transcript_api import YouTubeTranscriptApi
 
 # youtube-transcript-api internal module paths vary; support multiple layouts.
@@ -175,6 +178,102 @@ def _clean_vtt(text: str) -> str:
     return " ".join(out).strip()
 
 
+def _clean_json3(text: str) -> str:
+    try:
+        data = json.loads(text or "{}")
+    except Exception:
+        return ""
+    out = []
+    for ev in data.get("events") or []:
+        segs = ev.get("segs") or []
+        for s in segs:
+            t = s.get("utf8")
+            if t:
+                out.append(t.replace("\n", " "))
+    joined = " ".join(out)
+    joined = re.sub(r"\s+", " ", joined).strip()
+    return joined
+
+
+def _clean_srv_xml(text: str) -> str:
+    if not text:
+        return ""
+    parts = re.findall(r"<text[^>]*>([\s\S]*?)</text>", text)
+    cleaned = []
+    for p in parts:
+        p = html.unescape(p)
+        p = re.sub(r"<[^>]+>", "", p)
+        p = p.replace("\n", " ").strip()
+        if p:
+            cleaned.append(p)
+    joined = " ".join(cleaned)
+    joined = re.sub(r"\s+", " ", joined).strip()
+    return joined
+
+
+def _clean_caption_response(ext: str, body: str) -> str:
+    ext = (ext or "").lower()
+    b = (body or "")
+    if ext == "vtt" or "WEBVTT" in b.upper():
+        return _clean_vtt(b)
+    if ext in ("json3", "json") or (b.lstrip().startswith("{") and '"events"' in b):
+        return _clean_json3(b)
+    if ext in ("srv3", "srv2", "srv1", "ttml", "xml") or "<text" in b or "<transcript" in b:
+        return _clean_srv_xml(b)
+    return _clean_vtt(b)
+
+
+def _pick_caption_entry(caps: Dict, language: Optional[str]) -> Optional[Dict]:
+    if not caps:
+        return None
+    if language:
+        if language in caps and caps[language]:
+            return caps[language][0]
+        for k in caps.keys():
+            if k.lower().startswith(language.lower()) and caps[k]:
+                return caps[k][0]
+    for k in caps.keys():
+        if k.lower().startswith("en") and caps[k]:
+            return caps[k][0]
+    for k, arr in caps.items():
+        if arr:
+            return arr[0]
+    return None
+
+
+def _get_transcript_via_ytdlp(video_url: str, language: Optional[str], cookies_path: Optional[str]) -> Tuple[str, str]:
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "nocheckcertificate": True}
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+    except Exception as e:
+        return "", f"YTDLP:{type(e).__name__}"
+
+    subs = info.get("subtitles") or {}
+    autos = info.get("automatic_captions") or {}
+
+    entry = _pick_caption_entry(subs, language) or _pick_caption_entry(autos, language)
+    if not entry:
+        return "", "YTDLP:NoCaptions"
+
+    cap_url = entry.get("url") or ""
+    ext = entry.get("ext") or "vtt"
+    if not cap_url:
+        return "", "YTDLP:NoURL"
+
+    try:
+        r = requests.get(cap_url, headers={"User-Agent": UA}, timeout=25)
+        if r.status_code != 200:
+            return "", f"YTDLP:HTTP{r.status_code}"
+        txt = _clean_caption_response(ext, r.text or "")
+        if not txt:
+            return "", "YTDLP:EmptyTranscript"
+        return txt, ""
+    except Exception as e:
+        return "", f"YTDLP:{type(e).__name__}"
+
 def _fetch_watch_html(video_id: str) -> str:
     # Extra params sometimes bypass lightweight consent redirects
     url = f"https://www.youtube.com/watch?v={video_id}&bpctr=9999999999&has_verified=1"
@@ -237,13 +336,13 @@ def _get_transcript_via_watch_html(video_id: str, language: Optional[str]) -> Tu
     Fallback transcript method that mirrors the 'Show transcript' UI:
     1) Fetch watch HTML
     2) Extract captionTracks baseUrl
-    3) Download VTT and convert to plain text
+    3) Download captions (json3/vtt/xml) and convert to plain text
     '''
     try:
-        html = _fetch_watch_html(video_id)
-        if not html:
+        html_txt = _fetch_watch_html(video_id)
+        if not html_txt:
             return "", "WatchHTML:EmptyHTML"
-        tracks = _extract_caption_tracks_from_watch(html)
+        tracks = _extract_caption_tracks_from_watch(html_txt)
         if not tracks:
             return "", "WatchHTML:NoCaptionTracks"
         track = _pick_caption_track(tracks, language)
@@ -252,80 +351,84 @@ def _get_transcript_via_watch_html(video_id: str, language: Optional[str]) -> Tu
         base_url = track.get("baseUrl") or ""
         if not base_url:
             return "", "WatchHTML:NoBaseUrl"
-        # Ensure VTT
+
         sep = "&" if "?" in base_url else "?"
-        vtt_url = base_url + ("" if "fmt=" in base_url else f"{sep}fmt=vtt")
-        r = requests.get(vtt_url, headers={"User-Agent": UA}, timeout=25)
-        if r.status_code != 200:
-            return "", f"WatchHTML:HTTP{r.status_code}"
-        txt = _clean_vtt(r.text or "")
-        if not txt:
-            return "", "WatchHTML:EmptyTranscript"
-        return txt, ""
+        # Try multiple formats; YouTube may return xml/json rather than vtt
+        candidates = []
+        if "fmt=" in base_url:
+            candidates.append((base_url, ""))  # keep ext unknown
+        else:
+            candidates.append((base_url + f"{sep}fmt=json3", "json3"))
+            candidates.append((base_url + f"{sep}fmt=vtt", "vtt"))
+            candidates.append((base_url, ""))
+
+        for url, ext in candidates:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+            if r.status_code != 200:
+                continue
+            txt = _clean_caption_response(ext, r.text or "")
+            if txt:
+                return txt, ""
+        return "", "WatchHTML:EmptyTranscript"
     except Exception as e:
+        return "", f"WatchHTML:{type(e).__name__}"
+
         return "", f"WatchHTML:{type(e).__name__}: {e}"
 
 
-def _get_transcript(video_id: str, language: Optional[str], allow_auto: bool) -> Tuple[str, str]:
+def _get_transcript(video_id: str, language: Optional[str], allow_auto: bool, cookies_path: Optional[str] = None) -> Tuple[str, str]:
     '''
     Transcript strategy:
     1) Try youtube-transcript-api (fast when it works)
-    2) If missing/disabled, fall back to parsing YouTube watch HTML captionTracks and downloading VTT
+    2) Fallback: parse watch HTML captionTracks (json3/vtt/xml)
+    3) Fallback: yt-dlp subtitles/auto-captions extraction (often most robust)
     '''
     # 1) youtube-transcript-api
+    err = ""
     try:
         if language:
             try:
                 t = YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
-                return " ".join(x.get("text", "") for x in t).strip(), ""
+                return " ".join([x.get("text","") for x in t]).strip(), ""
             except Exception:
                 pass
-
-        tl = YouTubeTranscriptApi.list_transcripts(video_id)
-
-        try:
-            tr = tl.find_manually_created_transcript([language] if language else ["en"])
-            t = tr.fetch()
-            return " ".join(x.get("text", "") for x in t).strip(), ""
-        except Exception:
-            pass
-
         if allow_auto:
-            try:
-                tr = tl.find_generated_transcript([language] if language else ["en"])
-                t = tr.fetch()
-                return " ".join(x.get("text", "") for x in t).strip(), ""
-            except Exception:
-                pass
-
-        # Try any transcript available
-        try:
-            tr = next(iter(tl))
-            t = tr.fetch()
-            return " ".join(x.get("text", "") for x in t).strip(), ""
-        except Exception:
-            pass
-
-        err = "No transcript found"
+            t = YouTubeTranscriptApi.get_transcript(video_id)
+        else:
+            t = YouTubeTranscriptApi.list_transcripts(video_id).find_manually_created_transcript([language] if language else ["en"]).fetch()
+        txt = " ".join([x.get("text","") for x in t]).strip()
+        if txt:
+            return txt, ""
+        err = "YTA:EmptyTranscript"
     except TranscriptsDisabled:
-        err = "TranscriptsDisabled"
+        err = "YTA:TranscriptsDisabled"
     except NoTranscriptFound:
-        err = "NoTranscriptFound"
+        err = "YTA:NoTranscriptFound"
     except TooManyRequests:
-        err = "TooManyRequests"
+        err = "YTA:TooManyRequests"
     except VideoUnavailable:
-        err = "VideoUnavailable"
+        err = "YTA:VideoUnavailable"
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = f"YTA:{type(e).__name__}"
 
     # 2) Fallback via watch HTML
     txt, ferr = _get_transcript_via_watch_html(video_id, language)
     if txt:
         return txt, ""
-    return "", (ferr or err)
+    if ferr:
+        err = ferr
+
+    # 3) Fallback via yt-dlp subtitles
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    txt, yerr = _get_transcript_via_ytdlp(video_url, language, cookies_path)
+    if txt:
+        return txt, ""
+    return "", (yerr or err or "TranscriptUnavailable")
+
 
 def scrape_channel(
     channel_url: str,
+    cookies_txt: Optional[bytes] = None,
     youtube_api_key: Optional[str] = None,
     content_type: str = "shorts",
     scan_limit: int = 600,
@@ -343,10 +446,29 @@ def scrape_channel(
     debug.append(f"Normalized channel URL: {channel_url}")
 
     rows: List[Dict] = []
+    cookies_path: Optional[str] = None
+    if cookies_txt:
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tmp.write(cookies_txt)
+            tmp.flush()
+            tmp.close()
+            cookies_path = tmp.name
+            debug.append("cookies.txt provided (will use for transcript fetching).")
+        except Exception:
+            cookies_path = None
+            debug.append("cookies.txt provided but failed to write temp file.")
 
-    if not youtube_api_key:
-        debug.append("ERROR: Missing YouTube API key.")
-        return rows, debug
+
+if not youtube_api_key:
+    debug.append("ERROR: Missing YouTube API key.")
+    if cookies_path:
+        try:
+            import os
+            os.unlink(cookies_path)
+        except Exception:
+            pass
+    return rows, debug
 
     ch_id, uploads = _yt_api_channel_from_url(channel_url, youtube_api_key)
     debug.append(f"YouTube Data API enabled. channelId={ch_id} uploadsPlaylist={uploads}")
@@ -440,4 +562,10 @@ def scrape_channel(
             break
 
     debug.append(f"Returned rows: {len(rows)}")
+    if cookies_path:
+        try:
+            import os
+            os.unlink(cookies_path)
+        except Exception:
+            pass
     return rows, debug
