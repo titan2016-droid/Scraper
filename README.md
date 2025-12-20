@@ -21,3 +21,7 @@ OPENAI_API_KEY = "YOUR_KEY"
 
 ## v10 Hotfix
 If Streamlit shows an ImportError on `youtube_transcript_api._errors`, update to v10. This version is compatible with multiple youtube-transcript-api layouts and pins the dependency.
+
+
+## v11 Fix: 0 results on Streamlit Cloud
+If you see `Early stop: consecutive videos below min_views` and 0 results, add a YouTube Data API key in the sidebar. This makes view counts reliable and allows Popular-first + early-stop to work.

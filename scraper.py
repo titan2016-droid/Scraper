@@ -4,6 +4,7 @@ import time
 import html
 import tempfile
 import datetime
+import requests
 import xml.etree.ElementTree as ET
 from typing import Callable, Dict, List, Optional, Union, Tuple
 from urllib.request import Request, urlopen
@@ -376,8 +377,84 @@ def _thumbnail_urls(vinfo: Dict, video_id: str) -> Dict[str, str]:
     }
 
 
+
+def _yt_api_videos_map(video_ids: List[str], api_key: str) -> Dict[str, Dict]:
+    """Fetch snippet, contentDetails, statistics for a list of video IDs using YouTube Data API v3."""
+    out: Dict[str, Dict] = {}
+    if not api_key or not video_ids:
+        return out
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i+50]
+        params = {
+            "part": "snippet,contentDetails,statistics",
+            "id": ",".join(chunk),
+            "key": api_key,
+            "maxResults": 50,
+        }
+        try:
+            r = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=25)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            for item in data.get("items", []):
+                vid = item.get("id")
+                if vid:
+                    out[vid] = item
+        except Exception:
+            continue
+        time.sleep(0.12)
+    return out
+
+
+def _yt_api_extract_fields(item: Dict) -> Dict:
+    sn = item.get("snippet") or {}
+    stats = item.get("statistics") or {}
+    cd = item.get("contentDetails") or {}
+
+    thumbs = sn.get("thumbnails") or {}
+    def turl(key: str) -> str:
+        v = thumbs.get(key) or {}
+        return v.get("url") or ""
+
+    # Duration is ISO 8601 like PT59S, PT1M2S
+    dur_iso = cd.get("duration") or ""
+    dur_seconds = None
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", dur_iso)
+    if m:
+        h = int(m.group(1) or 0); mi = int(m.group(2) or 0); s = int(m.group(3) or 0)
+        dur_seconds = h*3600 + mi*60 + s
+
+    def to_int(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    return {
+        "publishedAt": sn.get("publishedAt") or "",
+        "channelId": sn.get("channelId") or "",
+        "channelTitle": sn.get("channelTitle") or "",
+        "title": sn.get("title") or "",
+        "description": sn.get("description") or "",
+        "tags_list": sn.get("tags") or [],
+        "categoryId": sn.get("categoryId") or "",
+        "defaultLanguage": sn.get("defaultLanguage") or "",
+        "defaultAudioLanguage": sn.get("defaultAudioLanguage") or "",
+        "thumbnail_default": turl("default"),
+        "thumbnail_medium": turl("medium"),
+        "thumbnail_high": turl("high"),
+        "thumbnail_standard": turl("standard"),
+        "thumbnail_maxres": turl("maxres"),
+        "view_count": to_int(stats.get("viewCount")),
+        "like_count": to_int(stats.get("likeCount")),
+        "comment_count": to_int(stats.get("commentCount")),
+        "duration_seconds": dur_seconds,
+    }
+
+
 def scrape_channel(
     channel_url: str,
+    youtube_api_key: Optional[str] = None,
     content_type: str = "shorts",
     scan_limit: int = 600,
     min_views: int = 300_000,
@@ -450,6 +527,12 @@ def scrape_channel(
     total = len(filtered)
     debug.append(f"Candidates after type filter: {total}")
 
+    api_map = {}
+    if youtube_api_key:
+        ids = [x["id"] for x in filtered if x.get("id")]
+        api_map = _yt_api_videos_map(ids, youtube_api_key)
+        debug.append(f"YouTube Data API enabled. Stats fetched for: {len(api_map)} videos.")
+
     ydl_opts_video = {"quiet": True, "skip_download": True, "nocheckcertificate": True}
     if cookiefile:
         ydl_opts_video["cookiefile"] = cookiefile
@@ -464,22 +547,40 @@ def scrape_channel(
         vid = item["id"]
         vurl = item.get("url") or f"https://www.youtube.com/watch?v={vid}"
 
-        title = item.get("title") or ""
-        view_count = None
-        canonical_url = vurl
-        vinfo = None
+title = item.get("title") or ""
+canonical_url = vurl
+vinfo = None
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
-                vinfo = ydl.extract_info(vurl, download=False)
-                if vinfo:
-                    title = vinfo.get("title") or title
-                    view_count = vinfo.get("view_count")
-                    canonical_url = vinfo.get("webpage_url") or canonical_url
-        except Exception:
-            continue
+api_item = api_map.get(vid) if api_map else None
+api_fields = _yt_api_extract_fields(api_item) if api_item else {}
 
-        if view_count is None:
+# We still call yt-dlp to get canonical URL + caption URLs (needed for transcripts)
+try:
+    with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
+        vinfo = ydl.extract_info(vurl, download=False)
+        if vinfo:
+            canonical_url = vinfo.get("webpage_url") or canonical_url
+except Exception:
+    continue
+
+# Prefer API view_count (reliable). Fallback to yt-dlp.
+view_count = api_fields.get("view_count")
+if view_count is None and vinfo:
+    view_count = vinfo.get("view_count")
+
+# If view_count is missing, treat as unknown.
+if view_count is None:
+    continue
+
+# Prefer API title if available, otherwise yt-dlp
+if api_fields.get("title"):
+    title = api_fields["title"]
+elif vinfo and vinfo.get("title"):
+    title = vinfo.get("title") or title
+
+
+        # If YouTube returns 0 for view_count (can happen without cookies), treat it as unknown.
+        if int(view_count) == 0:
             continue
 
         if int(view_count) < int(min_views):
@@ -492,23 +593,43 @@ def scrape_channel(
         else:
             below_streak = 0
 
-        publishedAt = _iso_published_at(vinfo or {})
-        channelId = (vinfo.get("channel_id") or vinfo.get("uploader_id") or "")
-        channelTitle = (vinfo.get("channel") or vinfo.get("uploader") or "")
-        uploader = (vinfo.get("uploader") or "")
-        tags = vinfo.get("tags") or []
-        categories = vinfo.get("categories") or []
-        categoryId = vinfo.get("category_id") or ""
-        defaultLanguage = vinfo.get("language") or vinfo.get("default_language") or ""
-        defaultAudioLanguage = vinfo.get("audio_language") or vinfo.get("default_audio_language") or ""
 
-        duration_seconds = vinfo.get("duration")
-        is_short = _is_shorts_candidate(canonical_url, duration_seconds)
+publishedAt = api_fields.get("publishedAt") or _iso_published_at(vinfo or {})
+channelId = api_fields.get("channelId") or (vinfo.get("channel_id") or vinfo.get("uploader_id") or "")
+channelTitle = api_fields.get("channelTitle") or (vinfo.get("channel") or vinfo.get("uploader") or "")
+uploader = (vinfo.get("uploader") or channelTitle or "")
+tags = api_fields.get("tags_list") or (vinfo.get("tags") or [])
+categories = vinfo.get("categories") or []
+categoryId = api_fields.get("categoryId") or (vinfo.get("category_id") or "")
+defaultLanguage = api_fields.get("defaultLanguage") or (vinfo.get("language") or vinfo.get("default_language") or "")
+defaultAudioLanguage = api_fields.get("defaultAudioLanguage") or (vinfo.get("audio_language") or vinfo.get("default_audio_language") or "")
 
-        thumbs = _thumbnail_urls(vinfo or {}, video_id=vid)
+duration_seconds = api_fields.get("duration_seconds")
+if duration_seconds is None:
+    duration_seconds = vinfo.get("duration")
+is_short = _is_shorts_candidate(canonical_url, duration_seconds)
 
-        like_count = vinfo.get("like_count")
-        comment_count = vinfo.get("comment_count")
+thumbs = None
+if api_item:
+    # Use API thumbnails if present, else fallback to yt-dlp/static
+    thumbs = {
+        "thumbnail_default": api_fields.get("thumbnail_default") or "",
+        "thumbnail_medium": api_fields.get("thumbnail_medium") or "",
+        "thumbnail_high": api_fields.get("thumbnail_high") or "",
+        "thumbnail_standard": api_fields.get("thumbnail_standard") or "",
+        "thumbnail_maxres": api_fields.get("thumbnail_maxres") or "",
+    }
+    if not any(thumbs.values()):
+        thumbs = None
+if thumbs is None:
+    thumbs = _thumbnail_urls(vinfo or {}, video_id=vid)
+
+like_count = api_fields.get("like_count")
+comment_count = api_fields.get("comment_count")
+if like_count is None:
+    like_count = vinfo.get("like_count")
+if comment_count is None:
+    comment_count = vinfo.get("comment_count")
 
         transcript = ""
         t_status = "not_found"

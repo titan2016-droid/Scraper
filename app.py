@@ -12,6 +12,7 @@ st.caption("Filters 300k+ views, ranks results, and outputs **video metadata + t
 
 with st.sidebar:
     st.header("Channel")
+    yt_api_key = st.text_input("YouTube Data API v3 Key (optional)", type="password", help="If provided, we use it to fetch reliable view counts + metadata (recommended on Streamlit Cloud).")
     channel_url_in = st.text_input("YouTube channel URL", placeholder="https://www.youtube.com/@davisfacts (no /shorts)")
     content_type = st.selectbox("Content type", ["shorts", "longform", "both"], index=0)
 
@@ -75,6 +76,8 @@ st.info(
 )
 
 if run_btn:
+    if early_stop and (yt_api_key.strip() == ""):
+        st.warning("Early-stop can return 0 results on Streamlit Cloud if YouTube blocks view counts. If you get 0 results, add a YouTube Data API key, or disable Early-stop.")
     if not channel_url_in.strip():
         st.error("Please enter a channel URL.")
         st.stop()
@@ -93,6 +96,7 @@ if run_btn:
 
     rows, debug = scrape_channel(
         channel_url=channel_url,
+        youtube_api_key=(yt_api_key.strip() or None),
         content_type=content_type,
         scan_limit=int(scan_limit),
         min_views=int(min_views),

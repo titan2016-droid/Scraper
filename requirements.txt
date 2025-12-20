@@ -3,4 +3,5 @@ pandas>=2.0.0
 yt-dlp>=2025.05.10
 youtube-transcript-api==0.6.2
 openai>=1.40.0
+requests>=2.31.0
 urllib3<3
