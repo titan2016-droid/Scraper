@@ -1,7 +1,7 @@
 streamlit>=1.36.0
 pandas>=2.0.0
 yt-dlp>=2025.05.10
-openai>=1.40.0
-urllib3<3
-requests>=2.31.0
 youtube-transcript-api==0.6.2
+openai>=1.40.0
+requests>=2.31.0
+urllib3<3

@@ -7,13 +7,13 @@ import os
 
 st.set_page_config(page_title="YouTube Transcript Scraper", page_icon="🎬", layout="wide")
 
-st.title("🎬 YouTube Transcript Scraper — Popular-first + Transcripts + Full Metadata")
-st.caption("Filters 300k+ views, ranks results, and outputs **video metadata + transcript** in one CSV.")
+st.title("🎬 YouTube Transcript Scraper — Popular-first + Guaranteed Transcripts")
+st.caption("Starts from **Popular** (highest views first), stops early when views drop below your threshold, and guarantees transcripts by transcribing audio if needed.")
 
 with st.sidebar:
     st.header("Channel")
-    yt_api_key = st.text_input("YouTube Data API v3 Key (optional)", type="password", help="Recommended on Streamlit Cloud to get reliable view counts + metadata.")
-    channel_url_in = st.text_input("YouTube channel URL", placeholder="https://www.youtube.com/@davisfacts (no /shorts)")
+    yt_api_key = st.text_input("YouTube Data API v3 Key (recommended)", type="password", help="Provides reliable view counts + metadata on Streamlit Cloud.")
+    channel_url_in = st.text_input("YouTube channel URL", placeholder="https://www.youtube.com/@davisfacts (do NOT add /shorts)")
     content_type = st.selectbox("Content type", ["shorts", "longform", "both"], index=0)
 
     st.divider()
@@ -38,24 +38,17 @@ with st.sidebar:
         index=0,
     )
     model = st.selectbox("Audio transcription model", ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"], index=0)
-    st.caption("For audio transcription, set OPENAI_API_KEY in Streamlit Secrets.")
 
-    st.divider()
-    st.header("Captions options")
     language = st.text_input("Preferred caption language (optional)", value="", help="Example: en (used for captions).")
     include_auto = st.checkbox("Allow auto-generated captions", value=True)
-
-    st.divider()
-    st.header("Output")
     show_errors = st.checkbox("Include transcript error details in CSV", value=True)
-    include_raw_description = st.checkbox("Include full description column", value=False, help="Descriptions can be long; leaving off keeps CSV lighter.")
 
     st.divider()
     st.header("Cookies (optional)")
     cookies_file = st.file_uploader("Upload cookies.txt", type=["txt"])
 
     st.divider()
-    run_btn = st.button("🚀 Scrape + Export CSV")
+    run_btn = st.button("🚀 Scrape + Rank")
 
 if channel_url_in.strip():
     normalized = normalize_channel_url(channel_url_in.strip())
@@ -71,13 +64,11 @@ if cookies_file is not None:
         f.write(cookies_file.getbuffer())
 
 st.info(
-    "This version exports metadata like published date, channel ID, tags, languages, and thumbnail URLs "
-    "alongside views + transcript."
+    "If you pasted a URL ending in **/shorts** or **/videos**, the app will auto-fix it. "
+    "If you previously got **0 results**, it was likely because the app ended up querying something like `/shorts/shorts?...`."
 )
 
 if run_btn:
-    if early_stop and (yt_api_key.strip() == ""):
-        st.warning("If you get 0 results on Streamlit Cloud, add a YouTube Data API key (view counts can be blocked), or disable Early-stop.")
     if not channel_url_in.strip():
         st.error("Please enter a channel URL.")
         st.stop()
@@ -111,18 +102,18 @@ if run_btn:
         openai_model=model,
         progress_cb=on_progress,
         return_debug=True,
-        include_description=include_raw_description,
     )
+
+    st.write("### Debug")
+    st.code("\n".join(debug))
 
     elapsed = time.time() - start
     status.text(f"Done. Returning {len(rows)} video(s) in {elapsed:.1f}s.")
     prog.progress(1.0)
 
-    with st.expander("Debug (advanced)"):
-        st.code("\n".join(debug))
-
     if not rows:
-        st.error("0 qualifying videos returned. Try increasing scan_limit, switching content type to 'both', or disabling Popular-first.")
+        st.error("0 qualifying videos returned.")
+        st.write("Try: (1) increase scan_limit, (2) switch to 'both', or (3) disable Popular-first, or (4) paste just the base channel URL (no /shorts).")
         st.stop()
 
     df = pd.DataFrame(rows)
@@ -130,48 +121,20 @@ if run_btn:
     st.write("### Transcript status summary")
     if "transcript_status" in df.columns:
         st.dataframe(df["transcript_status"].value_counts().rename_axis("status").reset_index(name="count"),
-                     use_container_width=True, height=240)
+                     use_container_width=True, height=260)
 
-    preferred = [
-        "rank",
-        "view_count",
-        "like_count",
-        "comment_count",
-        "publishedAt",
-        "duration_seconds",
-        "is_short",
-        "title",
-        "video_id",
-        "url",
-        "channelTitle",
-        "channelId",
-        "uploader",
-        "tags",
-        "categories",
-        "categoryId",
-        "defaultLanguage",
-        "defaultAudioLanguage",
-        "thumbnail_default",
-        "thumbnail_medium",
-        "thumbnail_high",
-        "thumbnail_standard",
-        "thumbnail_maxres",
-        "transcript_method",
-        "transcript_source",
-        "transcript_format",
-        "transcript_status",
-        "transcript",
-        "transcript_error",
-    ]
+    preferred = ["rank", "view_count", "title", "url", "video_id",
+                 "transcript_method", "transcript_source", "transcript_format",
+                 "transcript_status", "transcript", "transcript_error"]
     cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
     df = df[cols]
 
     st.write("### Preview")
-    st.dataframe(df, use_container_width=True, height=480)
+    st.dataframe(df, use_container_width=True, height=460)
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="⬇️ Download CSV",
+        label="⬇️ Download Ranked CSV",
         data=csv_bytes,
         file_name="channel_transcripts_ranked.csv",
         mime="text/csv"
