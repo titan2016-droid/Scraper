@@ -10,3 +10,7 @@ Note: Popular sort URL params like `sort=p` are widely used on channel tabs, but
 
 ## v13
 Adds optional YouTube Data API key to fetch reliable view counts + metadata and sort shorts by views (no reliance on the 'Popular' tab working). This prevents 0-result early-stop issues on Streamlit Cloud.
+
+
+## v14
+Fixes Streamlit ImportError for `youtube_transcript_api._errors` by supporting multiple import layouts and pinning `youtube-transcript-api==0.6.2`.

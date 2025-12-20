@@ -16,12 +16,27 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 # youtube-transcript-api internal module paths vary across versions; support multiple layouts.
 try:
+    # youtube-transcript-api internal module paths vary across versions; support multiple layouts.
+try:
     from youtube_transcript_api._errors import (
         TranscriptsDisabled,
         NoTranscriptFound,
         VideoUnavailable,
         TooManyRequests,
     )
+except Exception:
+    try:
+        from youtube_transcript_api import (
+            TranscriptsDisabled,
+            NoTranscriptFound,
+            VideoUnavailable,
+            TooManyRequests,
+        )
+    except Exception:
+        class TranscriptsDisabled(Exception): ...
+        class NoTranscriptFound(Exception): ...
+        class VideoUnavailable(Exception): ...
+        class TooManyRequests(Exception): ...
 except Exception:
     try:
         from youtube_transcript_api import (
