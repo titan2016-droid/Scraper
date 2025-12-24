@@ -1,6 +1,5 @@
-streamlit>=1.36.0
-pandas>=2.0.0
-yt-dlp>=2025.05.10
+streamlit==1.37.1
+pandas==2.2.2
+requests==2.32.3
+yt-dlp==2025.1.15
 youtube-transcript-api==0.6.2
-requests>=2.31.0
-urllib3<3
