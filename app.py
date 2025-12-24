@@ -14,87 +14,126 @@ st.set_page_config(
     layout="wide",
 )
 
+
 # -----------------------------
-# Theme toggle (CSS-based)
+# Theme toggle (robust CSS-based)
 # -----------------------------
 DEFAULT_THEME = "light"
 
 def _apply_theme(theme: str):
-    # Minimal but effective Streamlit theming via CSS
+    """Apply a light/dark theme via CSS overrides.
+
+    Streamlit runtime theme switching isn't fully supported, so we override key
+    containers with CSS. We target multiple selectors because Streamlit's DOM
+    can change between versions.
+    """
     if theme == "dark":
         bg = "#0b1220"
         panel = "#111a2c"
         text = "#e8eefc"
         muted = "#a9b6d3"
-        border = "rgba(255,255,255,0.08)"
+        border = "rgba(255,255,255,0.10)"
         accent = "#37B7FF"
+        code_bg = "#0f172a"
     else:
         bg = "#ffffff"
         panel = "#f7f8fb"
         text = "#0b1220"
         muted = "#5b667a"
-        border = "rgba(12,18,32,0.10)"
+        border = "rgba(12,18,32,0.12)"
         accent = "#1976d2"
+        code_bg = "#f2f4f8"
 
     st.markdown(
         f"""
 <style>
-/* App background */
-.stApp {{
-  background: {bg};
-  color: {text};
+html, body {{
+  background-color: {bg} !important;
+  background: {bg} !important;
+  color: {text} !important;
 }}
 
-/* Headings */
+.stApp, .stApp > div {{
+  background-color: {bg} !important;
+  background: {bg} !important;
+}}
+
+div[data-testid="stAppViewContainer"],
+div[data-testid="stAppViewContainer"] > .main,
+section.main,
+.block-container {{
+  background-color: {bg} !important;
+  background: {bg} !important;
+}}
+
+div[data-testid="stSidebar"] {{
+  background-color: {panel} !important;
+  background: {panel} !important;
+  border-right: 1px solid {border} !important;
+}}
+
+div[data-testid="stSidebar"] > div,
+div[data-testid="stSidebarContent"] {{
+  background-color: {panel} !important;
+  background: {panel} !important;
+}}
+
+header[data-testid="stHeader"] {{
+  background: {bg} !important;
+}}
+
 h1, h2, h3, h4, h5, h6, p, div, span, label {{
   color: {text};
 }}
 
-/* Sidebar */
-section[data-testid="stSidebar"] > div {{
-  background: {panel};
-  border-right: 1px solid {border};
-}}
+.na-muted {{ color: {muted} !important; }}
 
-/* Cards */
 .na-card {{
-  background: {panel};
-  border: 1px solid {border};
+  background: {panel} !important;
+  border: 1px solid {border} !important;
   border-radius: 16px;
   padding: 16px 18px;
   margin-bottom: 14px;
 }}
-.na-muted {{ color: {muted}; }}
 
-/* Inputs */
 div[data-baseweb="input"] > div,
 div[data-baseweb="textarea"] > div,
 div[data-baseweb="select"] > div {{
-  background: transparent;
-  border-radius: 12px;
+  background: transparent !important;
+  border-radius: 12px !important;
+  border-color: {border} !important;
 }}
 
-/* Buttons */
-.stButton>button {{
-  border-radius: 12px;
-  border: 1px solid {border};
-}}
-.stDownloadButton>button {{
-  border-radius: 12px;
-  border: 1px solid {border};
+div[data-baseweb="popover"] > div {{
+  background: {panel} !important;
+  color: {text} !important;
+  border: 1px solid {border} !important;
+  border-radius: 12px !important;
 }}
 
-/* Links / accent */
-a, a:visited {{ color: {accent}; }}
+.stButton > button,
+.stDownloadButton > button {{
+  border-radius: 12px !important;
+  border: 1px solid {border} !important;
+}}
 
-/* Dataframe */
 div[data-testid="stDataFrame"] {{
-  border: 1px solid {border};
-  border-radius: 16px;
-  overflow: hidden;
+  background: {panel} !important;
+  border: 1px solid {border} !important;
+  border-radius: 12px !important;
+  padding: 6px;
+}}
+
+pre, code {{
+  background: {code_bg} !important;
+  color: {text} !important;
+}}
+
+a, a:visited {{
+  color: {accent} !important;
 }}
 </style>
-        """,
+""",
         unsafe_allow_html=True,
     )
 
@@ -102,16 +141,22 @@ div[data-testid="stDataFrame"] {{
 if "theme" not in st.session_state:
     st.session_state.theme = DEFAULT_THEME
 
-_apply_theme(st.session_state.theme)
-
 # -----------------------------
 # Sidebar controls
 # -----------------------------
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
 
-    theme_toggle = st.toggle("🌙 Dark mode", value=(st.session_state.theme == "dark"))
-    st.session_state.theme = "dark" if theme_toggle else "light"
+    # Use checkbox instead of st.toggle for maximum compatibility on Streamlit Cloud.
+    dark_mode = st.checkbox(
+        "🌙 Dark mode",
+        value=(st.session_state.theme == "dark"),
+        key="na_dark_mode",
+        help="Switch between light and dark mode.",
+    )
+    st.session_state.theme = "dark" if dark_mode else "light"
+
+    # Apply theme immediately (same run) so the background updates correctly
     _apply_theme(st.session_state.theme)
 
     # API key: env -> secrets -> user input
@@ -152,7 +197,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔎 Defaults")
     max_videos = st.number_input("Max videos", min_value=1, max_value=2000, value=200, step=25)
-    only_shorts = st.toggle("Only Shorts (<= 60s)", value=True)
+    # Checkbox is more broadly supported than st.toggle.
+    only_shorts = st.checkbox("Only Shorts (<= 60s)", value=True)
 
 # -----------------------------
 # Header
