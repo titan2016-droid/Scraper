@@ -1,5 +1,6 @@
-streamlit==1.37.1
-pandas==2.2.2
-requests==2.32.3
-yt-dlp==2025.1.15
-youtube-transcript-api==0.6.2
+streamlit>=1.36.0
+requests>=2.31.0
+google-api-python-client>=2.120.0
+youtube-transcript-api>=0.6.2
+python-dotenv>=1.0.1
+yt-dlp>=2024.12.0
