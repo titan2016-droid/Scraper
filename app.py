@@ -12,24 +12,33 @@ APP_TITLE = "YouTube Transcript + Metadata Scraper"
 
 
 def _inject_theme_css(dark: bool) -> None:
-    """Force a full-page light/dark theme (including sidebar) via CSS."""
+    """Force a full-page light/dark theme (including sidebar) via CSS.
+
+    Streamlit has multiple nested containers that keep their own background colors.
+    The previous version only changed the <body> and a couple wrappers, so parts of
+    the UI stayed light even when toggled. This version aggressively targets the
+    major containers and common BaseWeb components.
+    """
+
     if dark:
         bg = "#0b1020"
         surface = "#0f172a"
-        surface2 = "#111b34"
+        surface2 = "#0c142b"
         text = "#e5e7eb"
         muted = "#9ca3af"
         border = "#22304a"
         accent = "#60a5fa"
+        accent_soft = "rgba(96, 165, 250, 0.15)"
         code_bg = "#0b1224"
     else:
         bg = "#f6f7fb"
         surface = "#ffffff"
-        surface2 = "#ffffff"
+        surface2 = "#f9fafb"
         text = "#0f172a"
         muted = "#475569"
         border = "#e5e7eb"
         accent = "#2563eb"
+        accent_soft = "rgba(37, 99, 235, 0.10)"
         code_bg = "#f1f5f9"
 
     st.markdown(
@@ -43,34 +52,62 @@ def _inject_theme_css(dark: bool) -> None:
   --muted: {muted};
   --border: {border};
   --accent: {accent};
+  --accent-soft: {accent_soft};
   --code-bg: {code_bg};
 }}
 
-/* App background */
+/* ===== App background (hit ALL wrappers) ===== */
+html, body {{ background: var(--app-bg) !important; color: var(--text) !important; }}
 .stApp {{ background: var(--app-bg) !important; color: var(--text) !important; }}
 div[data-testid="stAppViewContainer"] {{ background: var(--app-bg) !important; }}
+div[data-testid="stAppViewContainer"] > .main {{ background: var(--app-bg) !important; }}
 div[data-testid="stHeader"] {{ background: transparent !important; }}
 
-/* Sidebar */
-section[data-testid="stSidebar"] {{ background: var(--surface) !important; border-right: 1px solid var(--border) !important; }}
-section[data-testid="stSidebar"] * {{ color: var(--text) !important; }}
+/* ===== Sidebar ===== */
+section[data-testid="stSidebar"] {{
+  background: var(--surface) !important;
+  border-right: 1px solid var(--border) !important;
+}}
+section[data-testid="stSidebar"] > div {{ background: var(--surface) !important; }}
 
-/* Main container */
-.block-container {{ padding-top: 2.0rem; padding-bottom: 2.5rem; max-width: 1200px; }}
+/* ===== Layout ===== */
+.block-container {{ padding-top: 1.75rem; padding-bottom: 2.75rem; max-width: 1200px; }}
 
-/* Cards */
+/* ===== Cards ===== */
 .nu-card {{
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 18px;
   padding: 18px 18px;
-  box-shadow: 0 8px 30px rgba(0,0,0,0.06);
+  box-shadow: 0 10px 35px rgba(0,0,0,0.08);
 }}
-
-/* Headings + muted text */
+.nu-step {{
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  margin-right: 8px;
+}}
+.nu-badge {{
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+}}
 .nu-muted {{ color: var(--muted) !important; }}
 
-/* Inputs */
+/* ===== Typography tweaks ===== */
+h1, h2, h3, h4, h5, h6, p, span, label {{ color: var(--text) !important; }}
+
+/* ===== Inputs (BaseWeb + Streamlit) ===== */
 div[data-testid="stTextInput"] input,
 div[data-testid="stNumberInput"] input,
 div[data-testid="stTextArea"] textarea {{
@@ -80,20 +117,33 @@ div[data-testid="stTextArea"] textarea {{
   border-radius: 12px !important;
 }}
 
-/* Selects */
-div[data-testid="stSelectbox"] > div {{
+/* Selectbox: target BaseWeb select control */
+div[data-testid="stSelectbox"] div[data-baseweb="select"] > div {{
   background: var(--surface2) !important;
   border: 1px solid var(--border) !important;
   border-radius: 12px !important;
+  color: var(--text) !important;
 }}
 
-/* Buttons */
+/* Toggle/checkbox backgrounds */
+div[data-baseweb="checkbox"] > div {{
+  border-color: var(--border) !important;
+}}
+
+/* ===== Buttons ===== */
 .stButton > button {{
-  border-radius: 12px !important;
+  border-radius: 999px !important;
   border: 1px solid var(--border) !important;
+  padding: 0.65rem 1.0rem !important;
+  font-weight: 650 !important;
+}}
+.stButton > button[kind="primary"], .stButton > button[data-testid="baseButton-primary"] {{
+  background: var(--accent) !important;
+  color: white !important;
+  border-color: transparent !important;
 }}
 
-/* Dataframe */
+/* ===== Dataframe ===== */
 div[data-testid="stDataFrame"] {{
   background: var(--surface) !important;
   border: 1px solid var(--border) !important;
@@ -101,11 +151,14 @@ div[data-testid="stDataFrame"] {{
   overflow: hidden;
 }}
 
-/* Code blocks */
+/* ===== Code blocks ===== */
 code, pre {{ background: var(--code-bg) !important; }}
 
-/* Links */
+/* ===== Links ===== */
 a {{ color: var(--accent) !important; }}
+
+/* ===== Small polish ===== */
+hr {{ border-color: var(--border) !important; }}
 </style>
         """,
         unsafe_allow_html=True,
@@ -146,7 +199,16 @@ def main() -> None:
         st.markdown('<div class="nu-muted">Scrape channel videos, pull metadata + transcripts, export a CSV.</div>', unsafe_allow_html=True)
         st.divider()
 
-        st.toggle("🌙 Dark mode", key="dark_mode", value=False)
+        # Persist theme choice + force a clean rerun when toggled so the CSS
+        # re-applies consistently across Streamlit Cloud.
+        current_dark = bool(st.session_state.get("dark_mode", False))
+        new_dark = st.toggle("🌙 Dark mode", key="dark_mode", value=current_dark)
+        if "_last_dark_mode" not in st.session_state:
+            st.session_state["_last_dark_mode"] = new_dark
+        elif st.session_state["_last_dark_mode"] != new_dark:
+            st.session_state["_last_dark_mode"] = new_dark
+            st.rerun()
+
         _inject_theme_css(dark=bool(st.session_state.get("dark_mode")))
 
         st.markdown("### 🔐 API Key")
