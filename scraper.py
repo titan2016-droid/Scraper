@@ -1,368 +1,317 @@
-import csv
-import io
+\
+from __future__ import annotations
+
 import re
-from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import requests
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# Transcript dependency (optional at runtime if include_transcripts=False)
+# --- youtube-transcript-api imports (robust across versions) ---
 try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import (
+    from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
+    from youtube_transcript_api.errors import (  # type: ignore
         TranscriptsDisabled,
         NoTranscriptFound,
         VideoUnavailable,
         TooManyRequests,
+        CouldNotRetrieveTranscript,
     )
-except ModuleNotFoundError:
-    YouTubeTranscriptApi = None  # type: ignore
-    TranscriptsDisabled = NoTranscriptFound = VideoUnavailable = TooManyRequests = Exception  # type: ignore
+except Exception:  # pragma: no cover
+    from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
+    from youtube_transcript_api._errors import (  # type: ignore
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        VideoUnavailable,
+        TooManyRequests,
+        CouldNotRetrieveTranscript,
+    )
 
 
-ProgressCB = Optional[Callable[[float, str], None]]
+YOUTUBE_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/.*", re.I)
 
 
 def normalize_channel_url(url: str) -> str:
+    """Normalize common channel URL shapes (incl. @handle)."""
     url = (url or "").strip()
     if not url:
-        return url
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
+        return ""
+    # allow user to paste @handle only
+    if url.startswith("@"):
+        return f"https://www.youtube.com/{url}"
+    if not url.startswith("http"):
+        url = "https://" + url.lstrip("/")
+    # strip query/fragment
+    url = url.split("#", 1)[0].split("?", 1)[0]
     return url
 
 
-def _api_get(api_key: str, endpoint: str, params: Dict) -> Dict:
-    params = dict(params)
-    params["key"] = api_key
-    resp = requests.get(endpoint, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _extract_handle_or_id(channel_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _extract_handle_or_channel_id(channel_url: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Returns (channel_id, handle, username/custom) best effort.
+    Returns (handle, channel_id) if present.
+    - https://www.youtube.com/@davisfacts -> handle="davisfacts"
+    - https://www.youtube.com/channel/UCxxxx -> channel_id="UCxxxx"
     """
-    u = urlparse(channel_url)
-    path = (u.path or "").strip("/")
-    parts = path.split("/")
-    channel_id = None
-    handle = None
-    custom = None
+    channel_url = normalize_channel_url(channel_url)
 
-    # /channel/UCxxxx
-    if len(parts) >= 2 and parts[0].lower() == "channel":
-        channel_id = parts[1]
-        return channel_id, None, None
+    m = re.search(r"youtube\.com/@([^/]+)", channel_url, re.I)
+    if m:
+        return m.group(1), None
 
-    # /@handle
-    if parts and parts[0].startswith("@"):
-        handle = parts[0].lstrip("@")
-        return None, handle, None
+    m = re.search(r"youtube\.com/channel/([^/]+)", channel_url, re.I)
+    if m:
+        return None, m.group(1)
 
-    # /user/username
-    if len(parts) >= 2 and parts[0].lower() == "user":
-        custom = parts[1]
-        return None, None, custom
+    # legacy username / custom url: /c/Name or /user/Name or /Name
+    m = re.search(r"youtube\.com/(c|user)/([^/]+)", channel_url, re.I)
+    if m:
+        return m.group(2), None
 
-    # /c/customName  OR just /someName
-    if len(parts) >= 2 and parts[0].lower() == "c":
-        custom = parts[1]
-        return None, None, custom
+    m = re.search(r"youtube\.com/([^/]+)$", channel_url, re.I)
+    if m and m.group(1) not in {"watch", "shorts"}:
+        return m.group(1), None
 
-    if parts and parts[0]:
-        custom = parts[0]
-        return None, None, custom
-
-    return None, None, None
+    return None, None
 
 
-def resolve_channel_id(api_key: str, channel_url: str) -> Tuple[str, str]:
-    """
-    Resolve a channel URL into (channel_id, channel_title).
-    Supports:
-      - https://youtube.com/channel/UC...
-      - https://youtube.com/@handle
-      - https://youtube.com/user/username
-      - https://youtube.com/c/custom
-      - https://youtube.com/<custom>
-    """
-    channel_id, handle, custom = _extract_handle_or_id(channel_url)
+def _build_yt(api_key: str):
+    return build("youtube", "v3", developerKey=api_key, cache_discovery=False)
+
+
+def _resolve_channel_id(api_key: str, channel_url: str, debug: List[str]) -> str:
+    handle, channel_id = _extract_handle_or_channel_id(channel_url)
 
     if channel_id:
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/channels",
-            {"part": "snippet", "id": channel_id, "maxResults": 1},
-        )
-        items = data.get("items", [])
-        if not items:
-            raise ValueError("Could not resolve channel ID from URL.")
-        return channel_id, items[0]["snippet"]["title"]
+        debug.append(f"Resolved channel id from URL: {channel_id}")
+        return channel_id
 
-    if handle:
-        # Newer API supports forHandle
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/channels",
-            {"part": "snippet", "forHandle": handle, "maxResults": 1},
-        )
-        items = data.get("items", [])
-        if items:
-            return items[0]["id"], items[0]["snippet"]["title"]
+    yt = _build_yt(api_key)
 
-        # Fallback: search channels
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/search",
-            {"part": "snippet", "q": handle, "type": "channel", "maxResults": 5},
-        )
-        items = data.get("items", [])
-        if not items:
-            raise ValueError("Could not resolve channel handle.")
-        cid = items[0]["snippet"]["channelId"]
-        title = items[0]["snippet"]["channelTitle"]
-        return cid, title
-
-    if custom:
-        # Try forUsername (only works for legacy /user)
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/channels",
-            {"part": "snippet", "forUsername": custom, "maxResults": 1},
-        )
-        items = data.get("items", [])
-        if items:
-            return items[0]["id"], items[0]["snippet"]["title"]
-
-        # Fallback: search channels
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/search",
-            {"part": "snippet", "q": custom, "type": "channel", "maxResults": 5},
-        )
-        items = data.get("items", [])
-        if not items:
-            raise ValueError("Could not resolve channel URL. Try a /channel/UC... or /@handle URL.")
-        cid = items[0]["snippet"]["channelId"]
-        title = items[0]["snippet"]["channelTitle"]
-        return cid, title
-
-    raise ValueError("Invalid channel URL.")
-
-
-def _iso8601_duration_to_seconds(d: str) -> int:
-    # PT#H#M#S
-    if not d:
-        return 0
-    h = m = s = 0
-    mobj = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d)
-    if mobj:
-        h = int(mobj.group(1) or 0)
-        m = int(mobj.group(2) or 0)
-        s = int(mobj.group(3) or 0)
-    return h * 3600 + m * 60 + s
-
-
-def get_uploads_playlist_id(api_key: str, channel_id: str) -> str:
-    data = _api_get(
-        api_key,
-        "https://www.googleapis.com/youtube/v3/channels",
-        {"part": "contentDetails", "id": channel_id, "maxResults": 1},
-    )
-    items = data.get("items", [])
-    if not items:
-        raise ValueError("Could not fetch channel contentDetails.")
-    return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
-
-
-def list_video_ids_from_uploads(api_key: str, uploads_playlist_id: str, limit: int, progress_cb: ProgressCB = None) -> List[str]:
-    ids: List[str] = []
-    page_token = None
-    fetched = 0
-
-    while True:
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/playlistItems",
-            {
-                "part": "contentDetails",
-                "playlistId": uploads_playlist_id,
-                "maxResults": 50,
-                "pageToken": page_token or "",
-            },
-        )
-        for it in data.get("items", []):
-            vid = it.get("contentDetails", {}).get("videoId")
-            if vid:
-                ids.append(vid)
-                fetched += 1
-                if fetched >= limit:
-                    break
-
-        if progress_cb:
-            progress_cb(min(0.30, fetched / max(1, limit) * 0.30), f"Collected {fetched}/{limit} video IDs…")
-
-        if fetched >= limit:
-            break
-
-        page_token = data.get("nextPageToken")
-        if not page_token:
-            break
-
-    return ids
-
-
-def fetch_video_details(api_key: str, video_ids: List[str], progress_cb: ProgressCB = None) -> List[Dict]:
-    all_items: List[Dict] = []
-    total = len(video_ids)
-    for i in range(0, total, 50):
-        batch = video_ids[i : i + 50]
-        data = _api_get(
-            api_key,
-            "https://www.googleapis.com/youtube/v3/videos",
-            {"part": "snippet,statistics,contentDetails", "id": ",".join(batch), "maxResults": 50},
-        )
-        items = data.get("items", [])
-        all_items.extend(items)
-
-        if progress_cb:
-            done = min(total, i + len(batch))
-            # progress from 30% to 70%
-            base = 0.30
-            span = 0.40
-            progress_cb(base + (done / max(1, total)) * span, f"Fetched metadata for {done}/{total} videos…")
-
-    return all_items
-
-
-def _get_transcript_text(video_id: str) -> Tuple[str, bool, str]:
-    """
-    Returns (transcript_text, has_transcript, transcript_error).
-    """
-    if YouTubeTranscriptApi is None:
-        return "", False, "MissingDependency(youtube-transcript-api)"
+    # If we have a handle/custom identifier, use search to find channel id
+    query = handle or channel_url
+    debug.append(f"Resolving channel via search: q={query!r}")
 
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        text = " ".join([seg.get("text", "") for seg in transcript]).strip()
-        return text, bool(text), ""
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-        return "", False, type(e).__name__
-    except TooManyRequests:
-        return "", False, "TooManyRequests"
+        resp = yt.search().list(part="snippet", q=query, type="channel", maxResults=1).execute()
+        items = resp.get("items", [])
+        if not items:
+            raise ValueError("Could not resolve channel. Try using the /channel/UC... URL.")
+        ch_id = items[0]["snippet"]["channelId"]
+        debug.append(f"Resolved channel id via search: {ch_id}")
+        return ch_id
+    except HttpError as e:
+        debug.append(f"Channel resolve HttpError: {e}")
+        raise
+
+
+def _parse_iso8601_duration_to_seconds(duration: str) -> Optional[int]:
+    # PT#M#S format; may also contain hours
+    if not duration or not duration.startswith("PT"):
+        return None
+    hours = minutes = seconds = 0
+    m = re.search(r"(\d+)H", duration)
+    if m:
+        hours = int(m.group(1))
+    m = re.search(r"(\d+)M", duration)
+    if m:
+        minutes = int(m.group(1))
+    m = re.search(r"(\d+)S", duration)
+    if m:
+        seconds = int(m.group(1))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _get_transcript_text(video_id: str, languages: Optional[List[str]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (transcript_text, error_string).
+    """
+    languages = languages or ["en"]
+
+    try:
+        parts = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)  # type: ignore
+        text = " ".join([p.get("text", "") for p in parts]).strip()
+        return (text if text else None), None
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        return None, f"{type(e).__name__}"
+    except (VideoUnavailable,) as e:
+        return None, f"{type(e).__name__}"
+    except TooManyRequests as e:
+        return None, f"{type(e).__name__}"
+    except CouldNotRetrieveTranscript as e:
+        return None, f"{type(e).__name__}"
     except Exception as e:
-        return "", False, f"TranscriptError: {str(e)[:120]}"
+        return None, f"TranscriptError: {e}"
 
 
 def scrape_channel(
-    api_key: str,
     channel_url: str,
-    content_type: str = "both",  # shorts|videos|both
-    scan_limit: int = 500,
+    api_key: str,
+    content_type: str = "both",   # "shorts" | "videos" | "both"
+    scan_limit: int = 200,
     min_views: int = 0,
     popular_first: bool = True,
     include_transcripts: bool = True,
-    progress_cb: ProgressCB = None,
-) -> Tuple[List[Dict], bytes]:
+    transcript_languages: Optional[List[str]] = None,
+    sleep_every: int = 0,
+    debug: Optional[List[str]] = None,
+):
     """
-    Returns (rows, csv_bytes).
+    Scrape a channel's videos (metadata + optional transcripts) using YouTube Data API v3 + youtube-transcript-api.
+    Returns a list of rows (dicts).
     """
-    if not api_key:
-        raise ValueError("Missing YouTube API key.")
+    debug = debug if debug is not None else []
     channel_url = normalize_channel_url(channel_url)
 
-    if progress_cb:
-        progress_cb(0.02, "Resolving channel…")
-    channel_id, channel_title = resolve_channel_id(api_key, channel_url)
+    if not api_key:
+        raise ValueError("YouTube Data API key is required.")
+    if not channel_url:
+        raise ValueError("Please provide a YouTube Channel URL.")
 
-    if progress_cb:
-        progress_cb(0.06, f"Resolved: {channel_title} ({channel_id})")
-        progress_cb(0.10, "Getting uploads playlist…")
-    uploads_pid = get_uploads_playlist_id(api_key, channel_id)
+    scan_limit = int(max(1, min(int(scan_limit or 200), 2000)))
+    min_views = int(max(0, int(min_views or 0)))
+    content_type = (content_type or "both").lower().strip()
+    if content_type not in {"shorts", "videos", "both"}:
+        content_type = "both"
 
-    if progress_cb:
-        progress_cb(0.14, "Collecting video IDs…")
-    ids = list_video_ids_from_uploads(api_key, uploads_pid, scan_limit, progress_cb=progress_cb)
+    channel_id = _resolve_channel_id(api_key, channel_url, debug)
+    yt = _build_yt(api_key)
 
-    if not ids:
-        raise ValueError("No videos found for this channel (or scan limit too low).")
+    # Step 1: get uploads playlist
+    debug.append("Fetching channel contentDetails to locate uploads playlist...")
+    ch = yt.channels().list(part="contentDetails,snippet,statistics", id=channel_id, maxResults=1).execute()
+    ch_items = ch.get("items", [])
+    if not ch_items:
+        raise ValueError("Channel not found or not accessible.")
+    uploads_pl = ch_items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    channel_title = ch_items[0].get("snippet", {}).get("title")
+    channel_subs = ch_items[0].get("statistics", {}).get("subscriberCount")
 
-    if progress_cb:
-        progress_cb(0.32, "Fetching video details…")
-    items = fetch_video_details(api_key, ids, progress_cb=progress_cb)
+    debug.append(f"Channel: {channel_title} | subs={channel_subs} | uploads={uploads_pl}")
 
-    # Build rows
+    # Step 2: iterate playlist items to get video ids
+    debug.append("Listing videos from uploads playlist...")
+    video_ids: List[str] = []
+    next_token: Optional[str] = None
+
+    while True:
+        resp = yt.playlistItems().list(
+            part="contentDetails",
+            playlistId=uploads_pl,
+            maxResults=50,
+            pageToken=next_token,
+        ).execute()
+
+        for it in resp.get("items", []):
+            vid = it["contentDetails"]["videoId"]
+            video_ids.append(vid)
+            if len(video_ids) >= scan_limit:
+                break
+
+        if len(video_ids) >= scan_limit:
+            break
+
+        next_token = resp.get("nextPageToken")
+        if not next_token:
+            break
+
+    debug.append(f"Collected {len(video_ids)} video ids.")
+
+    # If popular_first, we'll need stats; order by views after fetching
+    # Step 3: fetch details in batches
     rows: List[Dict] = []
-    for it in items:
-        vid = it["id"]
-        snip = it.get("snippet", {})
-        stats = it.get("statistics", {})
-        cdet = it.get("contentDetails", {})
+    batch_size = 50
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i : i + batch_size]
+        try:
+            vids = yt.videos().list(part="snippet,statistics,contentDetails", id=",".join(batch), maxResults=len(batch)).execute()
+        except HttpError as e:
+            debug.append(f"videos.list HttpError (batch {i}): {e}")
+            raise
 
-        duration_sec = _iso8601_duration_to_seconds(cdet.get("duration", ""))
-        is_short = duration_sec <= 60
+        for v in vids.get("items", []):
+            vid = v["id"]
+            snippet = v.get("snippet", {}) or {}
+            stats = v.get("statistics", {}) or {}
+            content_details = v.get("contentDetails", {}) or {}
 
-        if content_type == "shorts" and not is_short:
-            continue
-        if content_type == "videos" and is_short:
-            continue
+            title = snippet.get("title")
+            published = snippet.get("publishedAt")
+            tags = snippet.get("tags", [])
+            thumbnails = snippet.get("thumbnails", {}) or {}
+            thumb = None
+            for k in ("maxres", "standard", "high", "medium", "default"):
+                if k in thumbnails:
+                    thumb = thumbnails[k].get("url")
+                    if thumb:
+                        break
 
-        views = int(stats.get("viewCount", 0) or 0)
-        if views < (min_views or 0):
-            continue
+            view_count = int(stats.get("viewCount", 0) or 0)
+            like_count = int(stats.get("likeCount", 0) or 0)
+            comment_count = int(stats.get("commentCount", 0) or 0)
 
-        row = {
-            "channel_title": channel_title,
-            "channel_id": channel_id,
-            "video_id": vid,
-            "title": snip.get("title", ""),
-            "url": f"https://www.youtube.com/watch?v={vid}",
-            "published_at": snip.get("publishedAt", ""),
-            "views": views,
-            "like_count": int(stats.get("likeCount", 0) or 0),
-            "comment_count": int(stats.get("commentCount", 0) or 0),
-            "duration_sec": duration_sec,
-            "is_short": is_short,
-            "has_transcript": False,
-            "transcript": "",
-            "transcript_error": "",
-        }
-        rows.append(row)
+            duration = content_details.get("duration")
+            seconds = _parse_iso8601_duration_to_seconds(duration) if duration else None
 
-    # Popular-first: order by views desc
+            # content_type filter
+            if content_type == "shorts" and seconds is not None and seconds > 60:
+                continue
+            if content_type == "videos" and seconds is not None and seconds <= 60:
+                continue
+
+            if view_count < min_views:
+                continue
+
+            row = {
+                "video_id": vid,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "title": title,
+                "published_at": published,
+                "duration_seconds": seconds,
+                "view_count": view_count,
+                "like_count": like_count,
+                "comment_count": comment_count,
+                "channel_title": channel_title,
+                "channel_id": channel_id,
+                "tags": ",".join(tags) if isinstance(tags, list) else (tags or ""),
+                "thumbnail": thumb,
+            }
+            rows.append(row)
+
+        if sleep_every and (i // batch_size + 1) % int(sleep_every) == 0:
+            time.sleep(1.0)
+
+    debug.append(f"After filtering: {len(rows)} videos.")
+
+    # Sort popular-first
     if popular_first:
-        rows.sort(key=lambda r: r.get("views", 0), reverse=True)
+        rows.sort(key=lambda r: r.get("view_count", 0), reverse=True)
+    else:
+        # playlist order is newest-first typically; keep as is
+        pass
 
-    if include_transcripts and rows:
-        total = len(rows)
-        for idx, r in enumerate(rows):
-            if progress_cb:
-                # progress from 70% to 95%
-                progress_cb(0.70 + (idx / max(1, total)) * 0.25, f"Fetching transcripts {idx+1}/{total}…")
+    # Rank
+    for idx, r in enumerate(rows, start=1):
+        r["rank"] = idx
 
-            t, has_t, terr = _get_transcript_text(r["video_id"])
+    # Step 4: transcripts (optional)
+    if include_transcripts:
+        debug.append("Fetching transcripts (where available)...")
+        for idx, r in enumerate(rows, start=1):
+            t, err = _get_transcript_text(r["video_id"], languages=transcript_languages)
             r["transcript"] = t
-            r["has_transcript"] = has_t
-            r["transcript_error"] = terr
+            r["transcript_error"] = err
+            # mild backoff if rate-limited
+            if err == "TooManyRequests":
+                time.sleep(2.0)
+            # short sleep to be polite when doing lots
+            if idx % 25 == 0:
+                time.sleep(0.2)
+    else:
+        for r in rows:
+            r["transcript"] = None
+            r["transcript_error"] = None
 
-    # CSV
-    if progress_cb:
-        progress_cb(0.97, "Building CSV…")
-
-    fieldnames = list(rows[0].keys()) if rows else [
-        "channel_title","channel_id","video_id","title","url","published_at","views",
-        "like_count","comment_count","duration_sec","is_short","has_transcript","transcript","transcript_error"
-    ]
-
-    bio = io.StringIO()
-    w = csv.DictWriter(bio, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        w.writerow(r)
-
-    if progress_cb:
-        progress_cb(1.0, "Ready.")
-
-    return rows, bio.getvalue().encode("utf-8")
+    return rows, debug
