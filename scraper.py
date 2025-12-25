@@ -1,435 +1,368 @@
+import csv
+import io
 import re
-import time
-import json
-import html as html_lib
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-import yt_dlp
 
+# Transcript dependency (optional at runtime if include_transcripts=False)
 try:
+    from youtube_transcript_api import YouTubeTranscriptApi
     from youtube_transcript_api._errors import (
         TranscriptsDisabled,
         NoTranscriptFound,
         VideoUnavailable,
         TooManyRequests,
     )
-except Exception:
-    try:
-        from youtube_transcript_api import (
-            TranscriptsDisabled,
-            NoTranscriptFound,
-            VideoUnavailable,
-            TooManyRequests,
-        )
-    except Exception:
-        class TranscriptsDisabled(Exception): ...
-        class NoTranscriptFound(Exception): ...
-        class VideoUnavailable(Exception): ...
-        class TooManyRequests(Exception): ...
-
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-except Exception:
+except ModuleNotFoundError:
     YouTubeTranscriptApi = None  # type: ignore
+    TranscriptsDisabled = NoTranscriptFound = VideoUnavailable = TooManyRequests = Exception  # type: ignore
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-YT_API_BASE = "https://www.googleapis.com/youtube/v3"
+
+ProgressCB = Optional[Callable[[float, str], None]]
 
 
 def normalize_channel_url(url: str) -> str:
     url = (url or "").strip()
     if not url:
         return url
-    if url.startswith("@"):
-        return "https://www.youtube.com/" + url
-    if url.startswith("http"):
-        return url
-    return "https://" + url
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    return url
 
 
-def _yt_api_get(path: str, params: Dict, timeout: int = 25) -> Optional[Dict]:
-    try:
-        r = requests.get(f"{YT_API_BASE}/{path}", params=params, timeout=timeout, headers={"User-Agent": UA})
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+def _api_get(api_key: str, endpoint: str, params: Dict) -> Dict:
+    params = dict(params)
+    params["key"] = api_key
+    resp = requests.get(endpoint, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def _yt_api_channel_from_url(channel_url: str, api_key: str) -> Tuple[Optional[str], Optional[str]]:
-    p = urlparse(channel_url)
-    path = (p.path or "").strip("/")
+def _extract_handle_or_id(channel_url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns (channel_id, handle, username/custom) best effort.
+    """
+    u = urlparse(channel_url)
+    path = (u.path or "").strip("/")
+    parts = path.split("/")
+    channel_id = None
+    handle = None
+    custom = None
 
-    if path.startswith("@"):
-        data = _yt_api_get("channels", {
-            "part": "snippet,contentDetails",
-            "forHandle": path.lstrip("@"),
-            "key": api_key,
-            "maxResults": 1,
-        })
-        if data and data.get("items"):
-            item = data["items"][0]
-            ch_id = item.get("id")
-            uploads = (((item.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
-            return ch_id, uploads
+    # /channel/UCxxxx
+    if len(parts) >= 2 and parts[0].lower() == "channel":
+        channel_id = parts[1]
+        return channel_id, None, None
 
-    m = re.search(r"/channel/([A-Za-z0-9_-]+)", channel_url)
-    if m:
-        ch_id = m.group(1)
-        data = _yt_api_get("channels", {
-            "part": "contentDetails",
-            "id": ch_id,
-            "key": api_key,
-            "maxResults": 1,
-        })
-        uploads = None
-        if data and data.get("items"):
-            uploads = (((data["items"][0].get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
-        return ch_id, uploads
+    # /@handle
+    if parts and parts[0].startswith("@"):
+        handle = parts[0].lstrip("@")
+        return None, handle, None
 
-    return None, None
+    # /user/username
+    if len(parts) >= 2 and parts[0].lower() == "user":
+        custom = parts[1]
+        return None, None, custom
 
+    # /c/customName  OR just /someName
+    if len(parts) >= 2 and parts[0].lower() == "c":
+        custom = parts[1]
+        return None, None, custom
 
-def _yt_api_playlist_video_ids(uploads_playlist_id: str, api_key: str, max_items: int) -> List[Dict]:
-    out: List[Dict] = []
-    page = None
-    while len(out) < max_items:
-        params = {"part": "snippet,contentDetails", "playlistId": uploads_playlist_id, "maxResults": 50, "key": api_key}
-        if page:
-            params["pageToken"] = page
-        data = _yt_api_get("playlistItems", params)
-        if not data:
-            break
-        for it in data.get("items") or []:
-            cd = it.get("contentDetails") or {}
-            sn = it.get("snippet") or {}
-            vid = cd.get("videoId")
-            if not vid:
-                continue
-            out.append({"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "playlist_publishedAt": sn.get("publishedAt") or ""})
-            if len(out) >= max_items:
-                break
-        page = data.get("nextPageToken")
-        if not page:
-            break
-        time.sleep(0.12)
-    return out
+    if parts and parts[0]:
+        custom = parts[0]
+        return None, None, custom
+
+    return None, None, None
 
 
-def _yt_api_videos_map(video_ids: List[str], api_key: str) -> Dict[str, Dict]:
-    out: Dict[str, Dict] = {}
-    for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i+50]
-        data = _yt_api_get("videos", {"part": "snippet,contentDetails,statistics", "id": ",".join(chunk), "key": api_key, "maxResults": 50})
-        if not data:
-            continue
-        for item in data.get("items") or []:
-            vid = item.get("id")
+def resolve_channel_id(api_key: str, channel_url: str) -> Tuple[str, str]:
+    """
+    Resolve a channel URL into (channel_id, channel_title).
+    Supports:
+      - https://youtube.com/channel/UC...
+      - https://youtube.com/@handle
+      - https://youtube.com/user/username
+      - https://youtube.com/c/custom
+      - https://youtube.com/<custom>
+    """
+    channel_id, handle, custom = _extract_handle_or_id(channel_url)
+
+    if channel_id:
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/channels",
+            {"part": "snippet", "id": channel_id, "maxResults": 1},
+        )
+        items = data.get("items", [])
+        if not items:
+            raise ValueError("Could not resolve channel ID from URL.")
+        return channel_id, items[0]["snippet"]["title"]
+
+    if handle:
+        # Newer API supports forHandle
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/channels",
+            {"part": "snippet", "forHandle": handle, "maxResults": 1},
+        )
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"], items[0]["snippet"]["title"]
+
+        # Fallback: search channels
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/search",
+            {"part": "snippet", "q": handle, "type": "channel", "maxResults": 5},
+        )
+        items = data.get("items", [])
+        if not items:
+            raise ValueError("Could not resolve channel handle.")
+        cid = items[0]["snippet"]["channelId"]
+        title = items[0]["snippet"]["channelTitle"]
+        return cid, title
+
+    if custom:
+        # Try forUsername (only works for legacy /user)
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/channels",
+            {"part": "snippet", "forUsername": custom, "maxResults": 1},
+        )
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"], items[0]["snippet"]["title"]
+
+        # Fallback: search channels
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/search",
+            {"part": "snippet", "q": custom, "type": "channel", "maxResults": 5},
+        )
+        items = data.get("items", [])
+        if not items:
+            raise ValueError("Could not resolve channel URL. Try a /channel/UC... or /@handle URL.")
+        cid = items[0]["snippet"]["channelId"]
+        title = items[0]["snippet"]["channelTitle"]
+        return cid, title
+
+    raise ValueError("Invalid channel URL.")
+
+
+def _iso8601_duration_to_seconds(d: str) -> int:
+    # PT#H#M#S
+    if not d:
+        return 0
+    h = m = s = 0
+    mobj = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d)
+    if mobj:
+        h = int(mobj.group(1) or 0)
+        m = int(mobj.group(2) or 0)
+        s = int(mobj.group(3) or 0)
+    return h * 3600 + m * 60 + s
+
+
+def get_uploads_playlist_id(api_key: str, channel_id: str) -> str:
+    data = _api_get(
+        api_key,
+        "https://www.googleapis.com/youtube/v3/channels",
+        {"part": "contentDetails", "id": channel_id, "maxResults": 1},
+    )
+    items = data.get("items", [])
+    if not items:
+        raise ValueError("Could not fetch channel contentDetails.")
+    return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+
+def list_video_ids_from_uploads(api_key: str, uploads_playlist_id: str, limit: int, progress_cb: ProgressCB = None) -> List[str]:
+    ids: List[str] = []
+    page_token = None
+    fetched = 0
+
+    while True:
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/playlistItems",
+            {
+                "part": "contentDetails",
+                "playlistId": uploads_playlist_id,
+                "maxResults": 50,
+                "pageToken": page_token or "",
+            },
+        )
+        for it in data.get("items", []):
+            vid = it.get("contentDetails", {}).get("videoId")
             if vid:
-                out[vid] = item
-        time.sleep(0.12)
-    return out
+                ids.append(vid)
+                fetched += 1
+                if fetched >= limit:
+                    break
+
+        if progress_cb:
+            progress_cb(min(0.30, fetched / max(1, limit) * 0.30), f"Collected {fetched}/{limit} video IDs…")
+
+        if fetched >= limit:
+            break
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return ids
 
 
-def _parse_iso8601_duration_to_seconds(dur_iso: str) -> Optional[int]:
-    if not dur_iso:
-        return None
-    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", dur_iso)
-    if not m:
-        return None
-    h = int(m.group(1) or 0)
-    mi = int(m.group(2) or 0)
-    s = int(m.group(3) or 0)
-    return h * 3600 + mi * 60 + s
+def fetch_video_details(api_key: str, video_ids: List[str], progress_cb: ProgressCB = None) -> List[Dict]:
+    all_items: List[Dict] = []
+    total = len(video_ids)
+    for i in range(0, total, 50):
+        batch = video_ids[i : i + 50]
+        data = _api_get(
+            api_key,
+            "https://www.googleapis.com/youtube/v3/videos",
+            {"part": "snippet,statistics,contentDetails", "id": ",".join(batch), "maxResults": 50},
+        )
+        items = data.get("items", [])
+        all_items.extend(items)
+
+        if progress_cb:
+            done = min(total, i + len(batch))
+            # progress from 30% to 70%
+            base = 0.30
+            span = 0.40
+            progress_cb(base + (done / max(1, total)) * span, f"Fetched metadata for {done}/{total} videos…")
+
+    return all_items
 
 
-def _yt_api_extract_fields(item: Dict) -> Dict:
-    sn = item.get("snippet") or {}
-    stats = item.get("statistics") or {}
-    cd = item.get("contentDetails") or {}
-
-    thumbs = sn.get("thumbnails") or {}
-    def turl(key: str) -> str:
-        v = thumbs.get(key) or {}
-        return v.get("url") or ""
-
-    def to_int(x):
-        try:
-            return int(x)
-        except Exception:
-            return None
-
-    dur_seconds = _parse_iso8601_duration_to_seconds(cd.get("duration") or "")
-
-    return {
-        "publishedAt": sn.get("publishedAt") or "",
-        "channelId": sn.get("channelId") or "",
-        "channelTitle": sn.get("channelTitle") or "",
-        "title": sn.get("title") or "",
-        "description": sn.get("description") or "",
-        "tags_list": sn.get("tags") or [],
-        "categoryId": sn.get("categoryId") or "",
-        "defaultLanguage": sn.get("defaultLanguage") or "",
-        "defaultAudioLanguage": sn.get("defaultAudioLanguage") or "",
-        "thumbnail_default": turl("default"),
-        "thumbnail_medium": turl("medium"),
-        "thumbnail_high": turl("high"),
-        "thumbnail_standard": turl("standard"),
-        "thumbnail_maxres": turl("maxres"),
-        "view_count": to_int(stats.get("viewCount")),
-        "like_count": to_int(stats.get("likeCount")),
-        "comment_count": to_int(stats.get("commentCount")),
-        "duration_seconds": dur_seconds,
-    }
-
-
-def _is_short(duration_seconds: Optional[int], url: str) -> bool:
-    if duration_seconds is not None:
-        return duration_seconds <= 60
-    return "/shorts/" in (url or "")
-
-
-def _pick_caption_url(vinfo: Dict) -> Optional[Tuple[str, str]]:
-    def best_from(d: Dict) -> Optional[Tuple[str, str]]:
-        if not d:
-            return None
-        langs = ["en"] if "en" in d else list(d.keys())
-        fmt_priority = ["json3", "vtt", "srv3", "srv2", "srv1", "ttml", "xml"]
-        for lang in langs:
-            tracks = d.get(lang) or []
-            tracks_sorted = sorted(tracks, key=lambda t: fmt_priority.index(t.get("ext")) if t.get("ext") in fmt_priority else 999)
-            for t in tracks_sorted:
-                if t.get("url") and t.get("ext"):
-                    return t["url"], t["ext"]
-        return None
-    res = best_from(vinfo.get("subtitles") or {})
-    if res:
-        return res
-    return best_from(vinfo.get("automatic_captions") or {})
-
-
-def _vtt_to_text(vtt: str) -> str:
-    lines = []
-    for line in (vtt or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("WEBVTT") or "-->" in line or re.match(r"^\d+$", line):
-            continue
-        line = re.sub(r"<[^>]+>", "", line).strip()
-        if line:
-            lines.append(line)
-    return " ".join(lines).strip()
-
-
-def _json3_to_text(js: str) -> str:
-    try:
-        data = json.loads(js)
-    except Exception:
-        return ""
-    out = []
-    for ev in data.get("events", []) if isinstance(data, dict) else []:
-        for s in ev.get("segs") or []:
-            t = s.get("utf8")
-            if t:
-                out.append(t.replace("\n", " ").strip())
-    return " ".join([x for x in out if x]).strip()
-
-
-def _xml_to_text(xml: str) -> str:
-    chunks = re.findall(r"<text[^>]*>(.*?)</text>", xml or "", flags=re.DOTALL)
-    cleaned = []
-    for c in chunks:
-        c = re.sub(r"<[^>]+>", "", c)
-        c = html_lib.unescape(c).replace("\n", " ").strip()
-        if c:
-            cleaned.append(c)
-    return " ".join(cleaned).strip()
-
-
-def _download_with_ydl(ydl: yt_dlp.YoutubeDL, url: str) -> Optional[str]:
-    try:
-        resp = ydl.urlopen(url)
-        raw = resp.read()
-        if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="ignore")
-        return str(raw)
-    except Exception:
-        return None
-
-
-def _get_transcript(video_url: str, video_id: str, vinfo: Dict, cookies_path: Optional[str]) -> Tuple[str, str]:
-    if YouTubeTranscriptApi is not None:
-        try:
-            tlist = YouTubeTranscriptApi.list_transcripts(video_id)
-            transcript = None
-            try:
-                transcript = tlist.find_manually_created_transcript(["en"])
-            except Exception:
-                transcript = None
-            if transcript is None:
-                try:
-                    transcript = tlist.find_generated_transcript(["en"])
-                except Exception:
-                    transcript = None
-            if transcript is None:
-                transcript = next(iter(tlist), None)
-            if transcript is not None:
-                parts = transcript.fetch()
-                text = " ".join([(p.get("text") or "").replace("\n", " ").strip() for p in parts if p.get("text")]).strip()
-                if text:
-                    return text, ""
-        except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, TooManyRequests) as e:
-            last_err = f"YTTranscriptAPI:{type(e).__name__}"
-        except Exception as e:
-            last_err = f"YTTranscriptAPI:{type(e).__name__}"
-    else:
-        last_err = "YTTranscriptAPI:NotInstalled"
+def _get_transcript_text(video_id: str) -> Tuple[str, bool, str]:
+    """
+    Returns (transcript_text, has_transcript, transcript_error).
+    """
+    if YouTubeTranscriptApi is None:
+        return "", False, "MissingDependency(youtube-transcript-api)"
 
     try:
-        ydl_opts = {"quiet": True, "nocheckcertificate": True, "skip_download": True, "http_headers": {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}}
-        if cookies_path:
-            ydl_opts["cookiefile"] = cookies_path
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            cap = _pick_caption_url(vinfo)
-            if not cap:
-                return "", "YTDLP:NoCaptions"
-            cap_url, cap_ext = cap
-            body = _download_with_ydl(ydl, cap_url)
-            if not body:
-                return "", "YTDLP:CaptionDownloadFailed"
-            cap_ext = (cap_ext or "").lower()
-            if cap_ext == "vtt":
-                txt = _vtt_to_text(body)
-            elif cap_ext == "json3":
-                txt = _json3_to_text(body)
-            else:
-                txt = _xml_to_text(body)
-            if txt:
-                return txt, ""
-            return "", "YTDLP:EmptyTranscript"
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        text = " ".join([seg.get("text", "") for seg in transcript]).strip()
+        return text, bool(text), ""
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+        return "", False, type(e).__name__
+    except TooManyRequests:
+        return "", False, "TooManyRequests"
     except Exception as e:
-        return "", f"YTDLP:{type(e).__name__}"
-
-    return "", last_err
+        return "", False, f"TranscriptError: {str(e)[:120]}"
 
 
 def scrape_channel(
+    api_key: str,
     channel_url: str,
-    youtube_api_key: str,
-    cookies_txt_bytes: Optional[bytes] = None,
-    content_type: str = "shorts",
-    min_views: int = 300000,
-    max_results: int = 100,
-    scan_limit: int = 800,
-    on_progress: Optional[Callable[[int, int, str], None]] = None,
-):
-    debug: List[str] = []
+    content_type: str = "both",  # shorts|videos|both
+    scan_limit: int = 500,
+    min_views: int = 0,
+    popular_first: bool = True,
+    include_transcripts: bool = True,
+    progress_cb: ProgressCB = None,
+) -> Tuple[List[Dict], bytes]:
+    """
+    Returns (rows, csv_bytes).
+    """
+    if not api_key:
+        raise ValueError("Missing YouTube API key.")
     channel_url = normalize_channel_url(channel_url)
 
-    cookies_path = None
-    if cookies_txt_bytes:
-        try:
-            import tempfile, os
-            fd, path = tempfile.mkstemp(prefix="cookies_", suffix=".txt")
-            with open(path, "wb") as f:
-                f.write(cookies_txt_bytes)
-            cookies_path = path
-            debug.append("cookies.txt provided: enabled yt-dlp cookiefile mode.")
-        except Exception:
-            cookies_path = None
-            debug.append("cookies.txt provided but could not be written; ignoring.")
+    if progress_cb:
+        progress_cb(0.02, "Resolving channel…")
+    channel_id, channel_title = resolve_channel_id(api_key, channel_url)
 
-    ch_id, uploads = _yt_api_channel_from_url(channel_url, youtube_api_key)
-    debug.append(f"YouTube Data API enabled. channelId={ch_id} uploadsPlaylist={uploads}")
-    if not uploads:
-        debug.append("Could not resolve uploads playlist via API. Check the channel URL.")
-        return [], debug
+    if progress_cb:
+        progress_cb(0.06, f"Resolved: {channel_title} ({channel_id})")
+        progress_cb(0.10, "Getting uploads playlist…")
+    uploads_pid = get_uploads_playlist_id(api_key, channel_id)
 
-    playlist_items = _yt_api_playlist_video_ids(uploads, youtube_api_key, max_items=min(max(scan_limit, 200), 5000))
-    ids = [x["id"] for x in playlist_items]
-    api_map = _yt_api_videos_map(ids, youtube_api_key) if ids else {}
-    debug.append(f"API videos fetched: {len(api_map)}")
+    if progress_cb:
+        progress_cb(0.14, "Collecting video IDs…")
+    ids = list_video_ids_from_uploads(api_key, uploads_pid, scan_limit, progress_cb=progress_cb)
 
-    candidates: List[Dict] = []
-    for it in playlist_items:
-        api_item = api_map.get(it["id"])
-        if not api_item:
-            continue
-        fields = _yt_api_extract_fields(api_item)
-        dur = fields.get("duration_seconds")
-        is_short = _is_short(dur, it["url"])
+    if not ids:
+        raise ValueError("No videos found for this channel (or scan limit too low).")
+
+    if progress_cb:
+        progress_cb(0.32, "Fetching video details…")
+    items = fetch_video_details(api_key, ids, progress_cb=progress_cb)
+
+    # Build rows
+    rows: List[Dict] = []
+    for it in items:
+        vid = it["id"]
+        snip = it.get("snippet", {})
+        stats = it.get("statistics", {})
+        cdet = it.get("contentDetails", {})
+
+        duration_sec = _iso8601_duration_to_seconds(cdet.get("duration", ""))
+        is_short = duration_sec <= 60
+
         if content_type == "shorts" and not is_short:
             continue
-        if content_type == "longform" and is_short:
+        if content_type == "videos" and is_short:
             continue
-        vc = fields.get("view_count") or 0
-        candidates.append({"id": it["id"], "url": it["url"], "fields": fields, "view_count": vc})
 
-    candidates.sort(key=lambda x: x.get("view_count") or 0, reverse=True)
-    debug.append(f"API candidates after type filter: {len(candidates)} (sorted by views desc)")
+        views = int(stats.get("viewCount", 0) or 0)
+        if views < (min_views or 0):
+            continue
 
-    qualifying = [c for c in candidates if int(c.get("view_count") or 0) >= int(min_views)]
-    debug.append(f"Qualifying by min_views={min_views}: {len(qualifying)}")
-    qualifying = qualifying[: int(max_results)]
-    debug.append(f"Will fetch transcripts for top {len(qualifying)} qualifying videos.")
-
-    rows: List[Dict] = []
-
-    ydl_opts_video = {"quiet": True, "skip_download": True, "nocheckcertificate": True, "http_headers": {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}}
-    if cookies_path:
-        ydl_opts_video["cookiefile"] = cookies_path
-
-    total = len(qualifying)
-    for i, item in enumerate(qualifying, start=1):
-        vid = item["id"]
-        url = item["url"]
-        fields = item["fields"]
-
-        if on_progress:
-            on_progress(i-1, total, f"Fetching transcript {i}/{total}: {(fields.get('title') or '')[:60]}")
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
-                vinfo = ydl.extract_info(url, download=False) or {}
-        except Exception:
-            vinfo = {}
-
-        transcript, terr = _get_transcript(url, vid, vinfo, cookies_path)
-
-        tags = fields.get("tags_list") or []
-        rows.append({
-            "rank": i,
+        row = {
+            "channel_title": channel_title,
+            "channel_id": channel_id,
             "video_id": vid,
-            "url": (vinfo.get("webpage_url") or url),
-            "title": fields.get("title") or (vinfo.get("title") or ""),
-            "view_count": int(fields.get("view_count") or 0),
-            "like_count": fields.get("like_count"),
-            "comment_count": fields.get("comment_count"),
-            "duration_seconds": fields.get("duration_seconds"),
-            "publishedAt": fields.get("publishedAt"),
-            "channelId": fields.get("channelId"),
-            "channelTitle": fields.get("channelTitle"),
-            "description": fields.get("description"),
-            "tags": ", ".join([str(t) for t in tags]),
-            "categoryId": fields.get("categoryId"),
-            "defaultLanguage": fields.get("defaultLanguage"),
-            "defaultAudioLanguage": fields.get("defaultAudioLanguage"),
-            "thumbnail": fields.get("thumbnail_maxres") or fields.get("thumbnail_high") or fields.get("thumbnail_medium") or "",
-            "transcript": transcript,
-            "transcript_error": terr,
-        })
+            "title": snip.get("title", ""),
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "published_at": snip.get("publishedAt", ""),
+            "views": views,
+            "like_count": int(stats.get("likeCount", 0) or 0),
+            "comment_count": int(stats.get("commentCount", 0) or 0),
+            "duration_sec": duration_sec,
+            "is_short": is_short,
+            "has_transcript": False,
+            "transcript": "",
+            "transcript_error": "",
+        }
+        rows.append(row)
 
-        if on_progress:
-            on_progress(i, total, f"Done {i}/{total}")
+    # Popular-first: order by views desc
+    if popular_first:
+        rows.sort(key=lambda r: r.get("views", 0), reverse=True)
 
-    if cookies_path:
-        try:
-            import os
-            os.remove(cookies_path)
-        except Exception:
-            pass
+    if include_transcripts and rows:
+        total = len(rows)
+        for idx, r in enumerate(rows):
+            if progress_cb:
+                # progress from 70% to 95%
+                progress_cb(0.70 + (idx / max(1, total)) * 0.25, f"Fetching transcripts {idx+1}/{total}…")
 
-    return rows, debug
+            t, has_t, terr = _get_transcript_text(r["video_id"])
+            r["transcript"] = t
+            r["has_transcript"] = has_t
+            r["transcript_error"] = terr
+
+    # CSV
+    if progress_cb:
+        progress_cb(0.97, "Building CSV…")
+
+    fieldnames = list(rows[0].keys()) if rows else [
+        "channel_title","channel_id","video_id","title","url","published_at","views",
+        "like_count","comment_count","duration_sec","is_short","has_transcript","transcript","transcript_error"
+    ]
+
+    bio = io.StringIO()
+    w = csv.DictWriter(bio, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+
+    if progress_cb:
+        progress_cb(1.0, "Ready.")
+
+    return rows, bio.getvalue().encode("utf-8")
