@@ -40,7 +40,16 @@ def apply_theme(is_dark: bool) -> None:
             --primary2:#A78BFA;
             --shadow:0 10px 25px rgba(0,0,0,.35);
           }
+          /* app containers */
           .stApp { background: var(--bg) !important; color: var(--text) !important; }
+          html, body { background: var(--bg) !important; color: var(--text) !important; }
+          [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main {
+            background: var(--bg) !important;
+          }
+          [data-testid="stHeader"], header { background: transparent !important; }
+          [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] {
+            background: transparent !important;
+          }
           [data-testid="stSidebar"] { background: var(--panel) !important; border-right: 1px solid var(--border) !important; }
           [data-testid="stSidebar"] * { color: var(--text) !important; }
           .block-container { padding-top: 2.0rem; padding-bottom: 3rem; }
@@ -63,6 +72,16 @@ def apply_theme(is_dark: bool) -> None:
             border: 1px solid var(--border) !important;
             border-radius: 12px !important;
           }
+          /* selectbox popover / menu */
+          div[data-baseweb="popover"], div[data-baseweb="menu"], ul[role="listbox"]{
+            background: rgba(15,23,42,0.96) !important;
+            border: 1px solid var(--border) !important;
+          }
+          ul[role="listbox"] *{ color: var(--text) !important; }
+          /* sliders / toggles */
+          [data-testid="stSlider"] *{ color: var(--text) !important; }
+          /* expanders */
+          details, summary{ color: var(--text) !important; }
           /* buttons */
           .stButton > button{
             border-radius: 12px !important;
@@ -90,7 +109,13 @@ def apply_theme(is_dark: bool) -> None:
             --primary2:#06B6D4;
             --shadow:0 10px 25px rgba(2,6,23,.08);
           }
+          /* app containers */
           .stApp { background: var(--bg) !important; color: var(--text) !important; }
+          html, body { background: var(--bg) !important; color: var(--text) !important; }
+          [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main {
+            background: var(--bg) !important;
+          }
+          [data-testid="stHeader"], header { background: transparent !important; }
           [data-testid="stSidebar"] { background: var(--panel) !important; border-right: 1px solid var(--border) !important; }
           .block-container { padding-top: 2.0rem; padding-bottom: 3rem; }
           .na-card{
@@ -111,6 +136,10 @@ def apply_theme(is_dark: bool) -> None:
             background: #FFFFFF !important;
             border: 1px solid var(--border) !important;
             border-radius: 12px !important;
+          }
+          div[data-baseweb="popover"], div[data-baseweb="menu"], ul[role="listbox"]{
+            background: #FFFFFF !important;
+            border: 1px solid var(--border) !important;
           }
           /* buttons */
           .stButton > button{
@@ -155,6 +184,23 @@ with st.sidebar:
         placeholder="Paste your YouTube Data API key…",
         help="Recommended: set this as a Streamlit Secret named YT_API_KEY so you don't paste it every time.",
     )
+    st.session_state["yt_api_key"] = yt_api_key
+
+    st.markdown("#### 🍪 Cookies (optional)")
+    cookie_upload = st.file_uploader(
+        "Upload a cookies.txt (Netscape format)",
+        type=["txt"],
+        help=(
+            "Only needed for edge cases where YouTube doesn't return transcripts normally. "
+            "Use cookies only for videos you are authorized to access. "
+            "Cookies are used for this run only and are not stored in the CSV."
+        ),
+    )
+    if cookie_upload is not None:
+        st.session_state["cookies_txt_bytes"] = cookie_upload.getvalue()
+        st.success("Cookies file loaded for this session.")
+    else:
+        st.session_state.pop("cookies_txt_bytes", None)
 
     st.markdown("---")
     st.markdown("#### ⚙️ Scrape settings")
@@ -218,7 +264,18 @@ if run:
     status_box.info("Starting scrape…")
 
     t0 = time.time()
+    cookie_path = None
     try:
+        cookie_bytes = st.session_state.get("cookies_txt_bytes")
+        if cookie_bytes:
+            import tempfile
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tmp.write(cookie_bytes)
+            tmp.flush()
+            tmp.close()
+            cookie_path = tmp.name
+
         rows, debug = scrape_channel(
             channel_url=channel_url,
             api_key=yt_api_key,
@@ -228,6 +285,7 @@ if run:
             popular_first=bool(popular_first),
             include_transcripts=bool(include_transcripts),
             transcript_languages=transcript_languages,
+            cookies_txt_path=cookie_path,
             debug=debug,
         )
     except Exception as e:
@@ -235,6 +293,12 @@ if run:
         with st.expander("Debug log"):
             st.code("\n".join(debug) if debug else "No debug info.")
         st.stop()
+    finally:
+        if cookie_path:
+            try:
+                os.remove(cookie_path)
+            except Exception:
+                pass
 
     took = time.time() - t0
     status_box.success(f"Done in {took:.1f}s • {len(rows)} video(s) returned.")

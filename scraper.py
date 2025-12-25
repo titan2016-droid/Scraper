@@ -30,6 +30,13 @@ except Exception:  # pragma: no cover
         CouldNotRetrieveTranscript,
     )
 
+# Optional: yt-dlp fallback for subtitle extraction (requires a cookies.txt)
+# Only use this for videos you are authorized to access.
+try:  # pragma: no cover
+    from yt_dlp import YoutubeDL  # type: ignore
+except Exception:  # pragma: no cover
+    YoutubeDL = None  # type: ignore
+
 
 YOUTUBE_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/.*", re.I)
 
@@ -124,26 +131,121 @@ def _parse_iso8601_duration_to_seconds(duration: str) -> Optional[int]:
     return hours * 3600 + minutes * 60 + seconds
 
 
-def _get_transcript_text(video_id: str, languages: Optional[List[str]] = None) -> Tuple[Optional[str], Optional[str]]:
+def _get_transcript_text(
+    video_id: str,
+    languages: Optional[List[str]] = None,
+    cookies_txt_path: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (transcript_text, error_string).
     """
     languages = languages or ["en"]
 
+    # Primary path: youtube-transcript-api (fast + simple)
     try:
         parts = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)  # type: ignore
         text = " ".join([p.get("text", "") for p in parts]).strip()
         return (text if text else None), None
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        return None, f"{type(e).__name__}"
-    except (VideoUnavailable,) as e:
-        return None, f"{type(e).__name__}"
-    except TooManyRequests as e:
-        return None, f"{type(e).__name__}"
-    except CouldNotRetrieveTranscript as e:
-        return None, f"{type(e).__name__}"
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, TooManyRequests, CouldNotRetrieveTranscript) as e:
+        primary_err = f"{type(e).__name__}"
     except Exception as e:
-        return None, f"TranscriptError: {e}"
+        primary_err = f"TranscriptError: {e}"
+
+    # Fallback path (optional): yt-dlp with user-provided cookies
+    if cookies_txt_path and YoutubeDL is not None:
+        try:
+            fallback_text = _get_subtitle_text_via_ytdlp(video_id, languages=languages, cookies_txt_path=cookies_txt_path)
+            if fallback_text:
+                return fallback_text, None
+        except Exception as e:  # keep primary error as the surfaced reason
+            return None, f"{primary_err} (+CookiesFallbackFailed: {type(e).__name__})"
+
+    return None, primary_err
+
+
+def _vtt_or_srt_to_text(raw: str) -> str:
+    """Best-effort cleanup for .vtt/.srt subtitle files."""
+    out: List[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("WEBVTT"):
+            continue
+        if "-->" in s:
+            continue
+        if s.isdigit():
+            continue
+        if s.startswith("NOTE"):
+            continue
+        # basic cue settings cleanup
+        if s.startswith("<") and s.endswith(">"):
+            continue
+        out.append(s)
+    text = " ".join(out)
+    # Remove leftover markup-ish tags
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _get_subtitle_text_via_ytdlp(
+    video_id: str,
+    languages: Optional[List[str]],
+    cookies_txt_path: str,
+) -> Optional[str]:
+    """Attempt to fetch subtitles using yt-dlp.
+
+    This is only intended as a fallback when youtube-transcript-api fails.
+    Requires a cookies.txt in Netscape format.
+    """
+    if YoutubeDL is None:
+        return None
+
+    import tempfile
+
+    # Expand language list to common variants (yt-dlp expects BCP47-ish strings)
+    langs = languages or ["en"]
+    expanded: List[str] = []
+    for l in langs:
+        l = (l or "").strip()
+        if not l:
+            continue
+        expanded.append(l)
+        if l.lower() == "en":
+            expanded.extend(["en-US", "en-GB"])
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": expanded or ["en"],
+            "subtitlesformat": "vtt/srt",
+            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            "cookiefile": cookies_txt_path,
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # Pick the largest subtitle file produced (usually the most complete)
+        candidates: List[str] = []
+        for fn in os.listdir(tmpdir):
+            if not fn.startswith(video_id + "."):
+                continue
+            if fn.endswith((".vtt", ".srt")):
+                candidates.append(os.path.join(tmpdir, fn))
+        if not candidates:
+            return None
+
+        best = max(candidates, key=lambda p: os.path.getsize(p))
+        raw = open(best, "r", encoding="utf-8", errors="ignore").read()
+        text = _vtt_or_srt_to_text(raw)
+        return text if text else None
 
 
 def scrape_channel(
@@ -155,6 +257,7 @@ def scrape_channel(
     popular_first: bool = True,
     include_transcripts: bool = True,
     transcript_languages: Optional[List[str]] = None,
+    cookies_txt_path: Optional[str] = None,
     sleep_every: int = 0,
     debug: Optional[List[str]] = None,
 ):
@@ -300,7 +403,11 @@ def scrape_channel(
     if include_transcripts:
         debug.append("Fetching transcripts (where available)...")
         for idx, r in enumerate(rows, start=1):
-            t, err = _get_transcript_text(r["video_id"], languages=transcript_languages)
+            t, err = _get_transcript_text(
+                r["video_id"],
+                languages=transcript_languages,
+                cookies_txt_path=cookies_txt_path,
+            )
             r["transcript"] = t
             r["transcript_error"] = err
             # mild backoff if rate-limited
